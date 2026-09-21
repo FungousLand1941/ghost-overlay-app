@@ -112,8 +112,17 @@ async function cleanupTranscript(cfg, { lines, background }) {
 // Cross-provider fallback (cfg.fallbackProvider: 'auto' | 'none' | provider id):
 // when the main provider's daily quota is used up on every model it has, the
 // same request goes to another configured provider (e.g. Gemini -> Groq).
+// The provider that will actually answer: the chosen one if it has a key,
+// otherwise whichever configured provider does. Pasting only a Claude key must
+// just work even while the "answer with" dropdown still says Gemini.
+function effectiveProvider(cfg) {
+  const chosen = cfg.provider || 'gemini';
+  if (hasKey(cfg, chosen)) return chosen;
+  return ['gemini', 'claude', 'openai'].find((p) => hasKey(cfg, p)) || chosen;
+}
+
 function fallbackOrder(cfg) {
-  const main = cfg.provider || 'gemini';
+  const main = effectiveProvider(cfg);
   const pref = cfg.fallbackProvider || 'auto';
   if (pref === 'none') return [main];
   const others = pref === 'auto' ? ['openai', 'gemini', 'claude'] : [pref];
@@ -123,7 +132,7 @@ function fallbackOrder(cfg) {
 async function* stream(cfg, { messages, system, signal }) {
   const order = fallbackOrder(cfg);
   const main = order[0];
-  if (!hasKey(cfg, main)) throw new Error(`No ${PROVIDER_LABEL[main]} API key set. Open settings (⚙) and paste one.`);
+  if (!hasKey(cfg, main)) throw new Error('No API key set for any provider. Open settings (⚙) and paste a Gemini, Claude, or OpenAI-compatible key.');
   const tried = [];
   for (let i = 0; i < order.length; i++) {
     const p = order[i];
@@ -163,4 +172,4 @@ async function testKey(cfg, { provider, apiKey }) {
   return { ok: true, model: testCfg[provider].model, ms: Date.now() - t0, reply: text.trim().slice(0, 40) };
 }
 
-module.exports = { MODELS, PROVIDER_LABEL, hasKey, fallbackOrder, stream, transcribe, testKey, summarize, digest, cleanupTranscript, systemPrompt, modeConfig, PROFILES: prompts.PROFILES };
+module.exports = { MODELS, PROVIDER_LABEL, hasKey, effectiveProvider, fallbackOrder, stream, transcribe, testKey, summarize, digest, cleanupTranscript, systemPrompt, modeConfig, PROFILES: prompts.PROFILES };

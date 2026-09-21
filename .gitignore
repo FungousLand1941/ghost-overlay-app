@@ -2,3 +2,8 @@ node_modules/
 dist/
 ghost-smoke*.png
 ghost-smoke*.jpg
+
+/ghost/
+dump-*.pcm
+dump-*.wav
+*.part

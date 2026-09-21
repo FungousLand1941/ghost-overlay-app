@@ -36,16 +36,20 @@
   }
   function scrollBottom() { el.messages.scrollTop = el.messages.scrollHeight; }
   function shortcutLabel(k) { return (cfg.shortcuts?.[k] || '').replace('CmdOrCtrl', navigator.platform.startsWith('Mac') ? 'Cmd' : 'Ctrl'); }
+  function keySet(p) { return p === 'gemini' ? cfg.gemini.apiKeySet : p === 'openai' ? (cfg.openai.apiKeySet || /localhost|127\.0\.0\.1/.test(cfg.openai.baseUrl || '')) : cfg.claude.apiKeySet; }
+  function providerName(p) { return p === 'gemini' ? 'Gemini' : p === 'openai' ? (cfg.openai.preset || 'OpenAI-compatible') : 'Claude'; }
+  // Mirrors providers.effectiveProvider(): the chosen provider if it has a key, else one that does.
+  function effectiveProvider() { const c = cfg.provider || 'gemini'; return keySet(c) ? c : (['gemini', 'claude', 'openai'].find(keySet) || c); }
   function refreshHeader() {
-    const p = cfg.provider || 'gemini';
+    const p = effectiveProvider();
     el.providerTag.textContent = p === 'gemini' ? (cfg.gemini.model || 'gemini') : p === 'openai' ? `${cfg.openai.preset || 'openai'}: ${cfg.openai.model || ''}` : (cfg.claude.model || 'claude');
     $('k-ask').textContent = shortcutLabel('ask');
     $('k-answer').textContent = shortcutLabel('answerAudio');
     $('k-listen').textContent = shortcutLabel('listen');
     $('k-toggle').textContent = shortcutLabel('toggle');
-    const hasKey = p === 'gemini' ? cfg.gemini.apiKeySet : p === 'openai' ? (cfg.openai.apiKeySet || /localhost|127\.0\.0\.1/.test(cfg.openai.baseUrl || '')) : cfg.claude.apiKeySet;
+    const hasKey = keySet(p);
     el.emptyWarn.classList.toggle('hidden', hasKey);
-    el.emptyWarn.textContent = hasKey ? '' : `No ${p === 'gemini' ? 'Gemini' : p === 'openai' ? (cfg.openai.preset || 'OpenAI-compatible') : 'Claude'} API key yet — open ⚙ to add one.`;
+    el.emptyWarn.textContent = hasKey ? '' : 'No API key yet — open ⚙ and paste a Gemini, Claude, or OpenAI-compatible key.';
   }
 
   function addMessage(m) {
@@ -934,9 +938,23 @@
     const gk = $('s-gemini-key').value.trim(); if (gk) patch.gemini.apiKey = gk;
     const ok = $('s-openai-key').value.trim(); if (ok) patch.openai.apiKey = ok;
     cfg = await window.ghost.setConfig(patch);
+    // Dropdown left on a provider with no key while another one has one? Follow the key.
+    const eff = effectiveProvider();
+    if (eff !== (cfg.provider || 'gemini')) { cfg = await window.ghost.setConfig({ provider: eff }); toast(`Answering with ${providerName(eff)} (the only provider with a key)`); }
     el.settings.classList.add('hidden');
     refreshHeader();
     toast('Saved');
+  }
+
+  // Just saved a key for `provider` while the "answer with" dropdown points at a
+  // provider with no key? Switch to the one that can actually answer.
+  async function adoptProvider(provider) {
+    const cur = cfg.provider || 'gemini';
+    if (cur === provider || keySet(cur)) return;
+    cfg = await window.ghost.setConfig({ provider });
+    $('s-provider').value = provider;
+    refreshHeader();
+    toast(`Answering with ${providerName(provider)} now`);
   }
 
   async function testKey(provider) {
@@ -951,13 +969,13 @@
     if (r.ok) {
       // A key that just answered is a key worth keeping: save it right away so
       // "tested but never pressed Save" can't happen.
-      if (typed) { cfg = await window.ghost.setConfig({ [provider]: { apiKey: typed } }); input.value = ''; input.placeholder = cfg[provider].apiKey; $(`s-${provider}-status`).textContent = '(set — paste to replace)'; refreshHeader(); }
+      if (typed) { cfg = await window.ghost.setConfig({ [provider]: { apiKey: typed } }); input.value = ''; input.placeholder = cfg[provider].apiKey; $(`s-${provider}-status`).textContent = '(set — paste to replace)'; refreshHeader(); await adoptProvider(provider); }
       out.className = 'test-result ok'; out.textContent = `✓ ${r.model} answered in ${r.ms} ms${r.reply ? ` ("${r.reply}")` : ''}${typed ? ' — key saved' : ''}`;
     } else {
       // The key itself is fine (Google/Anthropic accepted it) but the model/quota/network misbehaved:
       // keep the key so the app can retry with fallbacks instead of having nothing at all.
       const keyProblem = /invalid API key|rejected this key|No API key|UNAUTHENTICATED|not scoped to a workspace|works across workspaces/i.test(r.error || '');
-      if (typed && !keyProblem) { cfg = await window.ghost.setConfig({ [provider]: { apiKey: typed } }); input.value = ''; input.placeholder = cfg[provider].apiKey; $(`s-${provider}-status`).textContent = '(set — paste to replace)'; refreshHeader(); }
+      if (typed && !keyProblem) { cfg = await window.ghost.setConfig({ [provider]: { apiKey: typed } }); input.value = ''; input.placeholder = cfg[provider].apiKey; $(`s-${provider}-status`).textContent = '(set — paste to replace)'; refreshHeader(); await adoptProvider(provider); }
       out.className = 'test-result err'; out.textContent = `✗ ${r.error}${typed && !keyProblem ? ' — (key saved anyway: the key was accepted, the model/quota was the problem)' : ''}`;
     }
   }

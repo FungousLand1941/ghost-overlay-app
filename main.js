@@ -266,7 +266,8 @@ ipcMain.handle('chat:start', async (_e, { id, messages, profile, mode }) => {
   inflight = ac;
   // 'instant' = small fast model, no thinking, short answer; 'think' = full model + thinking.
   const cfg = providers.modeConfig(store.get(), mode || 'instant');
-  const modelName = cfg.provider === 'gemini' ? cfg.gemini.model : cfg.claude.model;
+  const answering = providers.effectiveProvider(cfg);
+  const modelName = answering === 'gemini' ? cfg.gemini.model : answering === 'openai' ? cfg.openai.model : cfg.claude.model;
   const t0 = Date.now(); let tFirst = 0; let chars = 0;
   try {
     for await (const token of providers.stream(cfg, { messages, system: providers.systemPrompt(cfg, profile, mode), signal: ac.signal })) {
