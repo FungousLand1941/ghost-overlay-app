@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self' blob:; connect-src 'none';" />
+  <title>Ghost</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app" class="panel">
+    <header id="bar">
+      <div class="drag">
+        <span id="dot" class="dot" title="Idle"></span>
+        <span class="brand">ghost</span>
+        <span id="provider-tag" class="tag">claude</span>
+        <span id="listen-tag" class="tag hidden">● listening</span>
+        <span id="req-tag" class="tag" title="API requests this session (click for breakdown)">0 req</span>
+      </div>
+      <div class="actions">
+        <div class="seg" title="Response mode">
+          <button id="mode-instant" data-mode="instant" title="Instant: small fast model, no thinking, ~80 words">⚡</button>
+          <button id="mode-think" data-mode="think" title="Think: full model with thinking, full-length answer">🧠</button>
+        </div>
+        <button id="btn-answer" class="btn primary big" title="Answer from the transcript (fastest — no screenshot)">Answer</button>
+        <button id="btn-ask" class="btn big" title="Transcript + a screenshot of your screen">Ask + 📷</button>
+        <button id="btn-listen" class="btn icon" title="Listen to the call">🎙</button>
+        <button id="btn-context" class="btn icon" title="Context: paste your paper / notes — remembered forever">📚<span id="ctx-count" class="badge hidden"></span></button>
+        <button id="btn-reset" class="btn icon" title="New conversation">↺</button>
+        <button id="btn-settings" class="btn icon" title="Settings">⚙</button>
+        <button id="btn-pause" class="btn icon" title="Pause AI: stop listening, cancel any reply, block every API call until resumed">⏸</button>
+        <button id="btn-hide" class="btn icon" title="Hide the overlay (Ghost keeps running — Ctrl+\ or the tray icon brings it back)">✕</button>
+        <button id="btn-quit-top" class="btn quit" title="Quit Ghost completely (Ctrl+Shift+Q)">Quit</button>
+      </div>
+    </header>
+
+    <section id="transcript" class="transcript hidden">
+      <div class="transcript-head">
+        <span class="meters">
+          <span class="meter" title="Other people (system audio)"><span class="meter-label">them</span><span class="meter-bar"><span id="lvl-system"></span></span></span>
+          <span class="meter" title="You (microphone)"><span class="meter-label">you</span><span class="meter-bar"><span id="lvl-mic"></span></span></span>
+        </span>
+        <div>
+          <button id="btn-stop-listen" class="btn tiny danger" title="Stop listening (closes the transcription sessions)">■ stop listening</button>
+          <button id="btn-clear-transcript" class="btn tiny" title="Clear transcript">clear</button>
+        </div>
+      </div>
+      <div id="transcript-text" class="transcript-text"></div>
+      <div id="transcript-interim" class="transcript-interim"></div>
+      <div id="transcript-status" class="transcript-status"></div>
+      <div id="memory-line" class="memory-line hidden" title="Rolling summary of everything said before the live window"></div>
+    </section>
+
+    <main id="messages" class="messages">
+      <div id="empty" class="empty">
+        <div class="empty-title">Invisible to screen share.</div>
+        <div class="empty-body">
+          <kbd id="k-answer">Ctrl+Shift+Enter</kbd> answer (transcript) ·
+          <kbd id="k-ask">Ctrl+Enter</kbd> ask (transcript + screen) ·
+          <kbd id="k-listen">Ctrl+Shift+L</kbd> listen ·
+          <kbd id="k-toggle">Ctrl+\</kbd> hide/show
+        </div>
+        <div id="empty-warn" class="empty-warn hidden"></div>
+      </div>
+    </main>
+
+    <footer id="composer">
+      <textarea id="input" rows="1" placeholder="Ask anything… (Enter to send)"></textarea>
+      <label class="shot-toggle" title="Attach a screenshot with this message">
+        <input type="checkbox" id="attach-shot" /> 📷
+      </label>
+      <button id="btn-send" class="btn primary">➤</button>
+      <button id="btn-stop" class="btn danger hidden">■</button>
+    </footer>
+
+    <div id="toast" class="toast hidden"></div>
+  </div>
+
+  <!-- Settings -->
+  <div id="settings" class="settings hidden">
+    <div class="settings-head">
+      <span>Settings</span>
+      <button id="btn-settings-close" class="btn">✕</button>
+    </div>
+    <div class="settings-body">
+      <div class="field">
+        <label>Provider</label>
+        <select id="s-provider">
+          <option value="gemini">Gemini (Google)</option>
+          <option value="openai">Groq / Cerebras / OpenRouter / Ollama (OpenAI-compatible)</option>
+          <option value="claude">Claude (Anthropic)</option>
+        </select>
+        <div class="field"><label>When the main provider's daily quota is used up</label>
+          <select id="s-fallback-provider">
+            <option value="auto">Automatically answer with any other configured provider (recommended)</option>
+            <option value="none">Just show the error</option>
+          </select></div>
+      </div>
+
+      <fieldset>
+        <legend>Claude</legend>
+        <div class="field"><label>API key <span id="s-claude-status" class="muted"></span></label>
+          <div class="keyrow"><input id="s-claude-key" type="password" placeholder="sk-ant-…" autocomplete="off" />
+          <button id="s-claude-test" class="btn" title="Make one tiny real request with this key">Test</button></div>
+          <div id="s-claude-test-result" class="test-result"></div></div>
+        <div class="field"><label>Workspace ID <span class="muted">(only if Test says the key "is not scoped to a workspace": Console → Settings → Workspaces → wrkspc_…)</span></label>
+          <input id="s-claude-workspace" type="text" placeholder="wrkspc_…" autocomplete="off" /></div>
+        <div class="field"><label>Model</label><select id="s-claude-model"></select></div>
+        <div class="field"><label>Effort <span class="muted">(when Response speed is "thorough"; fast/balanced override it)</span></label>
+          <select id="s-claude-effort">
+            <option value="low">low (fastest)</option>
+            <option value="medium">medium</option>
+            <option value="high">high</option>
+            <option value="xhigh">xhigh</option>
+            <option value="max">max (slowest)</option>
+          </select></div>
+        <div class="field row"><label><input type="checkbox" id="s-claude-fallbacks" /> Server-side refusal fallback</label></div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Gemini</legend>
+        <div class="field"><label>API key <span id="s-gemini-status" class="muted"></span></label>
+          <div class="keyrow"><input id="s-gemini-key" type="password" placeholder="AIza…" autocomplete="off" />
+          <button id="s-gemini-test" class="btn" title="Make one tiny real request with this key">Test</button></div>
+          <div id="s-gemini-test-result" class="test-result"></div></div>
+        <div class="field"><label>Model</label><select id="s-gemini-model"></select></div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Groq / Cerebras / OpenRouter / Ollama — OpenAI-compatible (fast free tiers)</legend>
+        <div class="field"><label>Preset</label>
+          <select id="s-openai-preset">
+            <option value="navy">NavyAI — free, 150+ models incl. Gemini / DeepSeek / Mistral, with vision (key sk-navy-…)</option>
+            <option value="groq">Groq — free, fastest (Llama 3.3 70B / 8B instant)</option>
+            <option value="cerebras">Cerebras — free, very fast</option>
+            <option value="openrouter">OpenRouter — free models</option>
+            <option value="ollama">Ollama — local, no key</option>
+            <option value="custom">Custom OpenAI-compatible endpoint</option>
+          </select>
+          <div id="s-openai-keyhint" class="muted small"></div></div>
+        <div class="field"><label>API key <span id="s-openai-status" class="muted"></span></label>
+          <div class="keyrow"><input id="s-openai-key" type="password" placeholder="gsk_…" autocomplete="off" />
+          <button id="s-openai-test" class="btn" title="Make one tiny real request with this key">Test</button></div>
+          <div id="s-openai-test-result" class="test-result"></div></div>
+        <div class="field"><label>Base URL</label><input id="s-openai-url" type="text" placeholder="https://api.groq.com/openai/v1" /></div>
+        <div class="field"><label>Model (Think mode)</label><input id="s-openai-model" type="text" placeholder="llama-3.3-70b-versatile" /></div>
+        <div class="field"><label>Model (Instant mode)</label><input id="s-openai-instant" type="text" placeholder="llama-3.1-8b-instant" /></div>
+        <div class="field row"><label><input type="checkbox" id="s-openai-vision" /> This model accepts images (needed for Ask + 📷; otherwise the screenshot is skipped)</label></div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Live listening</legend>
+        <div class="field"><label>Speech-to-text engine</label>
+          <select id="s-engine">
+            <option value="gemini">Gemini Live API — most accurate (default); falls back to local automatically if it can't connect or quota runs out</option>
+            <option value="local">Local only — free &amp; offline, runs on your CPU, never touches your quota</option>
+          </select>
+          <div id="s-model-status" class="muted small"></div></div>
+        <div class="field"><label>Local engine model (fallback / Local only)</label>
+          <select id="s-local-model">
+            <option value="nemo-fastconformer-en-80ms">NVIDIA FastConformer — accurate on real mics (480 MB, ~35 % of a core)</option>
+            <option value="zipformer-en-2023-06-26-int8">Zipformer int8 — light (72 MB, ~10 % of a core), weaker on noisy audio</option>
+          </select></div>
+        <div class="field"><label>AI transcript cleanup <span class="muted">(fix garbled local speech-to-text using the answering AI + your context)</span></label>
+          <select id="s-aicleanup">
+            <option value="auto">Auto — only when transcription is the local engine (recommended)</option>
+            <option value="on">Always on</option>
+            <option value="off">Off</option>
+          </select></div>
+        <div class="field row"><label><input type="checkbox" id="s-refine" /> Accuracy pass — re-transcribe each finished sentence with NVIDIA Parakeet 0.6B (punctuation, near-Gemini accuracy; +670 MB, ~1 s per sentence on CPU)</label></div>
+        <div class="field"><label>Call audio capture device</label>
+          <select id="s-call-device"></select>
+          <button id="s-find-device" class="btn" type="button" title="Play some call audio, then watch which device's bar moves">🔎 Find the device with audio</button>
+          <div id="device-finder" class="device-finder hidden"></div>
+          <div class="muted small">Loopback is captured <em>after</em> Windows' volume/mute — if your speakers are muted, Ghost hears nothing. Headphones at normal volume are fine, or pick a recording endpoint here (Stereo Mix, Voicemeeter Out B1, BlackHole…).</div></div>
+        <div class="field"><label>Transcription mode</label>
+          <select id="s-transcription-mode">
+            <option value="live">Streaming — Gemini Live API (words appear as they are spoken)</option>
+            <option value="chunk">Chunked — upload every N seconds (slower, most compatible)</option>
+          </select></div>
+        <div class="field"><label>Streaming model</label><select id="s-live-model"></select></div>
+        <div class="field"><label>Audio source</label>
+          <select id="s-audio-source">
+            <option value="both">Both — the call (system audio) + my microphone</option>
+            <option value="system">System audio only (what you hear — Windows only)</option>
+            <option value="mic">Microphone only</option>
+          </select></div>
+        <div class="field"><label>If streaming transcription fails or hits quota</label>
+          <select id="s-fallback">
+            <option value="pause">Stop listening and tell me (default — never spends requests on its own)</option>
+            <option value="chunk">Switch to chunked uploads (≈6 requests/min at 10 s; can hit free-tier limits)</option>
+          </select></div>
+        <div class="field"><label>Background request budget (per minute) <span class="muted">memory summaries, digests, chunked transcription</span></label><input id="s-budget" type="number" min="1" max="60" /></div>
+        <div class="field"><label>Chunked model (fallback)</label><select id="s-transcription-model"></select></div>
+        <div class="field"><label>Chunk length (seconds, chunked mode)</label><input id="s-chunk" type="number" min="3" max="20" /></div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Speed</legend>
+        <div class="muted small">Two modes, toggled with ⚡ / 🧠 in the header. <b>Instant</b>: small fast model, no thinking, ≤ ~80 words. <b>Think</b>: your main model with thinking, full-length answers.</div>
+        <div class="field"><label>Instant model (Gemini)</label><select id="s-instant-gemini"></select></div>
+        <div class="field"><label>Instant model (Claude)</label><select id="s-instant-claude"></select></div>
+        <div class="field"><label>Instant max output tokens</label><input id="s-instant-tokens" type="number" min="120" max="1200" step="10" /></div>
+        <div class="field"><label>Think mode thinking level</label>
+          <select id="s-think-speed">
+            <option value="balanced">Balanced — brief thinking</option>
+            <option value="thorough">Thorough — full thinking / your Claude effort setting</option>
+          </select></div>
+        <select id="s-speed" class="hidden"><option value="fast">fast</option></select>
+        <div class="field row"><label><input type="checkbox" id="s-auto-answer" /> Auto-answer (off by default): when someone asks you a question, start answering immediately without a click — spends a request per question</label></div>
+        <div class="field"><label>Screenshot size (long edge, px) <span class="muted">smaller = faster Ask</span></label><input id="s-shot-edge" type="number" min="640" max="2048" step="64" /></div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Behaviour</legend>
+        <div class="field"><label>Profile</label><select id="s-profile"></select></div>
+        <div class="field"><label>Custom instructions</label>
+          <textarea id="s-custom" rows="3" placeholder="e.g. I'm interviewing for a backend role, answer in Go."></textarea></div>
+        <div class="field"><label>Background notes <span id="s-docs-count" class="muted"></span></label>
+          <textarea id="s-docs" rows="4" placeholder="Quick paste: résumé, job description, agenda, product notes… (sent with every request)"></textarea></div>
+      </fieldset>
+
+        <div class="field row"><label><input type="checkbox" id="s-docs-full-instant" /> Instant mode uses full text of Context documents too (slower first word on long docs; default uses digests)</label></div>
+        <div class="field row"><label><input type="checkbox" id="s-memory" /> Rolling memory — summarise older transcript so long calls keep full context</label></div>
+        <div class="field"><label>Max output tokens</label><input id="s-max-tokens" type="number" min="256" max="64000" step="256" /></div>
+        <div class="field"><label>Opacity <span id="s-opacity-val" class="muted"></span></label>
+          <input id="s-opacity" type="range" min="0.2" max="1" step="0.05" /></div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Shortcuts (global)</legend>
+        <div id="s-shortcuts" class="shortcuts"></div>
+        <div class="muted small">Electron accelerator syntax, e.g. <code>Ctrl+Shift+K</code>, <code>CmdOrCtrl+Alt+Up</code>.</div>
+      </fieldset>
+
+      <div class="settings-actions">
+        <button id="btn-save" class="btn primary">Save</button>
+        <button id="btn-quit" class="btn danger">Quit Ghost</button>
+      </div>
+      <div class="muted small">Keys are stored encrypted in your OS keychain (DPAPI / Keychain). Nothing leaves this machine except direct calls to api.anthropic.com / generativelanguage.googleapis.com.</div>
+    </div>
+  </div>
+
+  <!-- Context: things Ghost should know forever -->
+  <div id="context" class="settings hidden">
+    <div class="settings-head">
+      <span>📚 Context — remembered forever</span>
+      <button id="btn-context-close" class="btn">✕</button>
+    </div>
+    <div class="settings-body">
+      <div class="muted small">Paste a paper (LaTeX is fine — it's cleaned, maths kept), a spec, your résumé, a job description, notes… Saved to disk and included in <b>every</b> answer from now on. 🧠 Think uses the full text; ⚡ Instant uses an auto-made digest so it stays fast.</div>
+      <div class="field"><label>Name (optional)</label><input id="ctx-name" type="text" placeholder="e.g. My paper — barriers" /></div>
+      <div class="field"><label>Paste here <span id="ctx-len" class="muted"></span></label>
+        <textarea id="ctx-text" rows="10" placeholder="Paste the whole thing. \documentclass … \end{document} works as-is."></textarea></div>
+      <div class="settings-actions">
+        <button id="btn-doc-paste" class="btn primary">Save to context</button>
+        <button id="btn-doc-add" class="btn">Add files… (.tex .pdf .docx .md .txt)</button>
+      </div>
+      <div id="doc-drop" class="doc-drop"><div>…or drop files anywhere on this window</div></div>
+      <div class="field"><label>Saved context <span id="ctx-total" class="muted"></span></label>
+        <div id="doc-list" class="doc-list"></div></div>
+    </div>
+  </div>
+
+  <script src="markdown.js"></script>
+  <script src="audio.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

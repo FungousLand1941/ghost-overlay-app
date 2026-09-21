@@ -1,0 +1,103 @@
+{
+  "name": "ghost",
+  "version": "0.1.0",
+  "description": "Screen-share-invisible AI overlay. Bring your own Claude or Gemini API key.",
+  "main": "main.js",
+  "author": "you",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "smoke": "cross-env GHOST_SMOKE=1 electron .",
+    "dist": "electron-builder --win portable",
+    "test": "node test/store.test.js && node test/cleanup.test.js && node test/governor.test.js && node test/docs.test.js && node test/mock-gemini.js && node test/mock-openai.js && node test/mock-live.js --selftest && node test/scenario-binary-tree.js",
+    "test:affinity": "powershell -ExecutionPolicy Bypass -File test/affinity-probe.ps1 -Toggle",
+    "dist:mac": "electron-builder --mac"
+  },
+  "devDependencies": {
+    "cross-env": "^7.0.3",
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "latest",
+    "mammoth": "^1.12.3",
+    "pdf-parse": "^1.1.1",
+    "sherpa-onnx-node": "^1.13.8",
+    "ws": "^8.21.3"
+  },
+  "build": {
+    "appId": "dev.ghost.overlay",
+    "productName": "Ghost",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "src/**/*",
+      "package.json",
+      "!test/**"
+    ],
+    "asarUnpack": [
+      "src/providers/local-stt-worker.js",
+      "src/providers/local-stt-refine-worker.js",
+      "node_modules/sherpa-onnx-node/**",
+      "node_modules/sherpa-onnx-win-x64/**",
+      "node_modules/sherpa-onnx-darwin-arm64/**",
+      "node_modules/sherpa-onnx-darwin-x64/**",
+      "node_modules/sherpa-onnx-linux-x64/**"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "signAndEditExecutable": false
+    },
+    "portable": {
+      "artifactName": "Ghost.exe"
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ],
+      "category": "public.app-category.productivity",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "Ghost transcribes your microphone so it can answer questions from the conversation.",
+        "NSCameraUsageDescription": "Not used by Ghost.",
+        "NSScreenCaptureUsageDescription": "Ghost captures a screenshot of your screen only when you press Ask, to answer about what is on screen.",
+        "LSUIElement": true
+      }
+    },
+    "linux": {
+      "target": "AppImage"
+    },
+    "dmg": {
+      "artifactName": "Ghost-${arch}.dmg"
+    }
+  },
+  "allowScripts": {
+    "electron@33.4.11": true
+  }
+}
