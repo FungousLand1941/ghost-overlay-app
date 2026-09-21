@@ -1,0 +1,21 @@
+\documentclass{article}
+\usepackage{amsmath}
+\title{A Toy Paper for Smoke Tests}
+\begin{document}
+\maketitle
+\begin{abstract}
+We study the quantity $\rho(n)$ and show $\rho(n) \le 2$ for all $n \ge 1$. % comment
+\end{abstract}
+\section{Introduction}
+Earlier work~\cite{a,b} established $O(n^2)$ bounds; we improve this to $O(n \log n)$ (Theorem~\ref{thm:main}).
+\section{Method}
+\begin{itemize}
+\item Partition the input into $\sqrt{n}$ blocks.
+\item Apply the greedy rule to each block.
+\end{itemize}
+\begin{theorem}[Main]\label{thm:main}
+For every $n \ge 1$, $\rho(n) \le 2$.
+\end{theorem}
+\section{Results}
+On 1{,}000 random instances the mean ratio was $1.37$ with maximum $1.92$.
+\end{document}

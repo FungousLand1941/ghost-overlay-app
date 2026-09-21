@@ -1,0 +1,4 @@
+node_modules/
+dist/
+ghost-smoke*.png
+ghost-smoke*.jpg
