@@ -491,7 +491,7 @@ ipcMain.handle('ai:pause', (_e, paused) => {
 
 // ---- local speech-to-text (free, offline) ----
 const localStt = require('./src/providers/local-stt');
-localStt.init(() => path.join(app.getPath('userData'), 'models'));
+localStt.init(() => process.env.GHOST_MODELS || path.join(app.getPath('userData'), 'models')); // GHOST_MODELS: reuse real models in self-test
 localStt.onRefineLog = (line) => { log('[stt:accuracy]', line); send('live:event', { type: 'status', text: line }); };
 app.whenReady().then(() => { const t = store.get().transcription || {}; localStt.setModel(t.localModel); localStt.setRefine(t.refine !== false); });
 ipcMain.handle('stt:model', async (_e, { download } = {}) => {
@@ -779,6 +779,25 @@ async function runSmoke() {
     if (process.env.GHOST_SMOKE === 'frames') {
       // fast mode: only the streaming-audio frame check (harness plays TTS meanwhile)
       results.frames = await win.webContents.executeJavaScript(fs.readFileSync(path.join(__dirname, 'test', 'smoke-frames.js'), 'utf8'));
+      console.log('[ghost] SMOKE_OK', JSON.stringify(results, null, 2));
+      return;
+    }
+    if (process.env.GHOST_SMOKE === 'media') {
+      // real-app mp4 ingestion: renderer -> IPC -> ffmpeg -> offline recogniser -> docs
+      const file = process.env.GHOST_SMOKE_FILE;
+      results.media = await win.webContents.executeJavaScript(`(async () => {
+        const events = [];
+        const done = new Promise((resolve) => window.ghost.onDocsEvent((ev) => {
+          events.push(ev.type + (ev.text ? ': ' + ev.text : ''));
+          if (ev.type === 'update') { const d = ev.docs[ev.docs.length - 1]; if (d && !d.processing) resolve(d); }
+          if (ev.type === 'error') resolve({ error: ev.text });
+        }));
+        const r = await window.ghost.docsAddPath(${JSON.stringify(file)}, { describeFrames: false });
+        const d = await Promise.race([done, new Promise((res) => setTimeout(() => res({ error: 'timeout' }), 240000))]);
+        return { start: { ok: r.ok, background: r.background, error: r.error, kind: r.doc && r.doc.kind }, events: events.slice(-6), doc: d };
+      })()`);
+      const text = results.media.doc && results.media.doc.id ? docs.text(results.media.doc.id) : '';
+      results.media.textHead = text.slice(0, 400);
       console.log('[ghost] SMOKE_OK', JSON.stringify(results, null, 2));
       return;
     }
