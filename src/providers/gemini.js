@@ -7,6 +7,7 @@ function toGeminiContents(messages) {
   for (const m of messages) {
     const parts = [];
     if (m.image?.data) parts.push({ inlineData: { mimeType: m.image.mime || 'image/jpeg', data: m.image.data } });
+    for (const im of m.images || []) { if (im.label) parts.push({ text: im.label }); parts.push({ inlineData: { mimeType: im.mime || 'image/jpeg', data: im.data } }); }
     parts.push({ text: m.text || (m.image ? 'Here is my screen.' : '') });
     const role = m.role === 'assistant' ? 'model' : 'user';
     const prev = out[out.length - 1];

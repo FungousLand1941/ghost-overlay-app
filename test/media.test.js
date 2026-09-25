@@ -49,7 +49,13 @@ function check(name, ok, extra) { n++; if (!ok) { console.error('FAIL', name, ex
   const vid = path.join(tmp, 'v.mp4');
   execFileSync(ff, ['-nostdin', '-loglevel', 'error', '-f', 'lavfi', '-i', 'color=c=red:s=320x240:d=65', '-f', 'lavfi', '-i', 'color=c=blue:s=320x240:d=65', '-filter_complex', '[0:v][1:v]concat=n=2:v=1[v]', '-map', '[v]', '-r', '5', '-pix_fmt', 'yuv420p', vid]);
   const frames = await media.extractFrames(vid, { everySec: 30 });
-  check('frames: duplicates dropped, scene change kept, timestamps real', frames.length >= 2 && frames.length <= 3 && frames[0].t === 0 && frames.some((f) => f.t >= 60 && f.t <= 90) && frames.every((f) => f.jpeg[0] === 0xff && f.jpeg[1] === 0xd8), frames.map((f) => [f.t, f.jpeg.length]));
+  const ts = frames.map((f) => Math.round(f.t));
+  check('frames: scene change at 65 s caught, 30 s cadence kept, timestamps real', frames.length >= 5 && frames.length <= 8 && ts[0] === 0 && ts.some((t) => t >= 64 && t <= 67) && ts.some((t) => t === 30) && frames.every((f) => f.jpeg[0] === 0xff && f.jpeg[1] === 0xd8), ts);
+  check('frame notes parsed back to the nearest frame', JSON.stringify(media.parseFrameNotes('[00:00] Title slide: "Intro"\n- bullet one\n**[01:05]** speaker on camera\n[01:36] - Code: x = 1', [{ t: 0 }, { t: 65 }, { t: 95 }])) === '[[0,"Title slide: \\"Intro\\"\\n- bullet one"],[65,"speaker on camera"],[95,"Code: x = 1"]]');
+  // silent video + a stub reader: frames are batched with timestamps and merged as ON SCREEN lines
+  const calls = [];
+  const rv = await media.transcribeFile(vid, { everySec: 30, frameEverySec: 30, describeFrames: async (batch) => { calls.push(batch.map((b) => b.label)); return batch.map((b) => `[${b.label}] slide at ${b.label}: ${b.data.length > 100 ? 'jpeg ok' : 'bad'}`).join('\n'); } });
+  check('screen reading: batches of ≤6 labelled frames, merged in time order', calls.length >= 1 && calls.every((c) => c.length <= 6) && calls[0][0] === '00:00' && /^\[00:00\] ON SCREEN: slide at 00:00: jpeg ok/.test(rv.text) && /\[01:0[4-7]\] ON SCREEN/.test(rv.text) && rv.frames === frames.length, [calls, rv.text.slice(0, 160)]);
 
   // 5. end to end: Windows speech synthesis -> mp4 -> offline transcript (needs the Parakeet model on disk)
   const localStt = require('../src/providers/local-stt');

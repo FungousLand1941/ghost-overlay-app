@@ -269,6 +269,7 @@ ipcMain.handle('chat:start', async (_e, { id, messages, profile, mode }) => {
   const answering = providers.effectiveProvider(cfg);
   const modelName = answering === 'gemini' ? cfg.gemini.model : answering === 'openai' ? cfg.openai.model : cfg.claude.model;
   const t0 = Date.now(); let tFirst = 0; let chars = 0;
+  attachExcerpts(messages, mode || 'instant', cfg);
   try {
     for await (const token of providers.stream(cfg, { messages, system: providers.systemPrompt(cfg, profile, mode), signal: ac.signal })) {
       if (ac.signal.aborted) break;
@@ -519,7 +520,7 @@ async function runPendingDigests() {
       send('docs:event', { type: 'update', docs: docs.list() });
       try {
         const t0 = Date.now();
-        const text = await providers.digest(store.get(), docs.text(d.id));
+        const text = await providers.digest(store.get(), docs.digestSource(d.id));
         docs.update(d.id, { digest: text, digestStatus: 'ready', digestAt: Date.now() });
         log('[docs] digest ready', d.name, `${text.length} chars in ${Date.now() - t0}ms`);
       } catch (err) {
@@ -596,25 +597,39 @@ async function renderPage(url) {
   } finally { try { w.destroy(); } catch {} }
 }
 
-// Describe one video frame with the answering AI (opt-in "what's on screen" pass; throttled by the governor).
-const FRAME_PROMPT = 'This is one frame from a video the user wants to study. In at most 4 short lines, state what is on screen that carries information: copy slide titles, bullet text, code, equations and captions verbatim; describe diagrams/whiteboards concretely. If it is only a person talking or a blank/transition frame, reply exactly: speaker on camera';
+// Big libraries (a whole website, hours of video) don't fit the prompt: attach the
+// sections most relevant to this question to the user turn (the system prompt stays cacheable).
+function attachExcerpts(messages, mode, cfg) {
+  const m = mode === 'think' ? 'think' : 'instant';
+  const partial = docs.partialDocs(m, { instantUsesFull: !!cfg.instantUsesFullDocs });
+  const last = messages[messages.length - 1];
+  if (!partial.length || !last || last.role === 'assistant') return;
+  const excerpts = docs.retrieve(last.text || '', { maxChars: m === 'think' ? 60000 : 12000, onlyDocs: partial });
+  if (!excerpts) return;
+  last.text = `${last.text || ''}\n\nRELEVANT EXCERPTS FROM YOUR BACKGROUND DOCUMENTS (selected for this question; the full documents are too large to send whole):\n<<<\n${excerpts}\n>>>`;
+  log('[docs] attached excerpts', `${excerpts.length} chars from ${partial.length} large doc(s)`);
+}
+
+// Read a batch of video frames with the answering AI (throttled by the governor).
+const FRAME_PROMPT = (n) => `These are ${n} frames from a video the user is studying, in order, each labelled with its timestamp. For EACH frame write one block that starts with its exact timestamp in square brackets (e.g. "[12:30] …") and contains what is on screen that carries information: copy slide titles, bullet text, code, equations, captions and labels verbatim; describe diagrams, charts and whiteboard content concretely (what is drawn, what it shows, the values). If a frame only shows a person talking, a blank or a transition, write "[mm:ss] speaker on camera". Plain text, no markdown headings.`;
 function frameDescriber(cfg) {
-  return async (jpegBase64) => {
+  return async (frames) => { // [{ t, label, data }]
     for (let attempt = 0; ; attempt++) {
       const blocked = gate('digest');
       if (!blocked) break;
       if (attempt >= 6) throw new Error(blocked);
       await sleep(30000);
     }
+    const c = { ...providers.modeConfig(cfg, 'instant'), maxTokens: 2500 };
     let out = '';
-    for await (const t of providers.stream(providers.modeConfig(cfg, 'instant'), { messages: [{ role: 'user', text: FRAME_PROMPT, image: { data: jpegBase64, mime: 'image/jpeg' } }], system: 'You turn video frames into study notes. Be concrete and brief; copy visible text verbatim.' })) out += t;
+    for await (const t of providers.stream(c, { messages: [{ role: 'user', text: FRAME_PROMPT(frames.length), images: frames.map((f) => ({ data: f.data, mime: 'image/jpeg', label: `Frame at [${f.label}]` })) }], system: 'You turn video frames into precise study notes. Be concrete; copy visible text verbatim; never invent content that is not visible.' })) out += t;
     return out.trim();
   };
 }
 
 // One media job at a time (ffmpeg + the recogniser are heavy). The entry appears at once and fills in when done.
 let mediaChain = Promise.resolve();
-function startMediaDoc(input, { describeFrames = false, name = null } = {}) {
+function startMediaDoc(input, { describeFrames = null, frameEverySec = null, name = null } = {}) {
   const isUrl = /^https?:\/\//i.test(input);
   const entry = docs.addEntry({ name: name || (isUrl ? decodeURIComponent(input.split('/').pop().split('?')[0]) || input : path.basename(input)), kind: 'video', source: input, processing: 'queued…' });
   docsChanged();
@@ -622,9 +637,10 @@ function startMediaDoc(input, { describeFrames = false, name = null } = {}) {
     if (!docs.get(entry.id)) return; // removed while queued
     const cfg = store.get();
     try {
-      const r = await media.transcribeFile(input, { onProgress: (p) => docProgress(entry.id, p.text), describeFrame: describeFrames ? frameDescriber(cfg) : null, frameEverySec: 60 });
+      const wantScreen = describeFrames == null ? cfg.videoScreen !== false : !!describeFrames;
+      const r = await media.transcribeFile(input, { onProgress: (p) => docProgress(entry.id, p.text), describeFrames: wantScreen ? frameDescriber(cfg) : null, frameEverySec: frameEverySec || cfg.videoFrameSec || 30 });
       if (!docs.get(entry.id)) return;
-      const head = `# ${entry.name}\nSource: ${input}\nDuration: ${media.fmtTime(r.seconds)} · transcribed on this computer (${localStt.REFINE_MODEL.id})${r.frames ? ' · on-screen notes about every 60 s' : ''}\n\n`;
+      const head = `# ${entry.name}\nSource: ${input}\nDuration: ${media.fmtTime(r.seconds)} · transcribed on this computer (${localStt.REFINE_MODEL.id})${r.frames ? ' · ON SCREEN lines = what was shown at that moment (read by the AI at every slide change)' : ''}\n\n`;
       docs.setText(entry.id, head + r.text, { kind: r.hasVideo ? 'video' : 'audio', seconds: r.seconds });
       log('[docs] media ready', entry.name, `${r.lines} lines, ${r.frames} frames, ${media.fmtTime(r.seconds)}`);
       runPendingDigests();
@@ -656,9 +672,10 @@ async function youtubeDoc(c, onProgress, describeFrames) {
   return { text: head + parts.join('\n\n'), patch: { name: title, kind: 'video', seconds: info.seconds || null } };
 }
 
-function startUrlDoc(url, { wholeSite = true, describeFrames = false } = {}) {
+function startUrlDoc(url, { wholeSite = true, describeFrames = null, frameEverySec = null } = {}) {
   const c = web.classifyUrl(url);
-  if (c.kind === 'media') return startMediaDoc(c.url, { describeFrames });
+  if (c.kind === 'media') return startMediaDoc(c.url, { describeFrames, frameEverySec });
+  if (describeFrames == null) describeFrames = store.get().videoScreen !== false;
   const entry = docs.addEntry({ name: c.kind === 'youtube' ? `YouTube ${c.id}` : c.url, kind: c.kind === 'youtube' ? 'video' : 'web', source: c.url, processing: 'starting…' });
   docsChanged();
   (async () => {

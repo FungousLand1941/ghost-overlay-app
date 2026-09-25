@@ -58,7 +58,7 @@ For every $n$, $\\rho(n) \\le 2$.
   const think = docs.contextFor('think');
   check('think: full text of the paper', /# Introduction/.test(think) && /\(full text\)/.test(think));
   const instantNoDigest = docs.contextFor('instant');
-  check('instant before digest: full text with a note', /digest not ready yet/.test(instantNoDigest));
+  check('instant before digest: full text is sent (it fits)', /\(full text\)/.test(instantNoDigest) && /# Introduction/.test(instantNoDigest));
   docs.update(entry.id, { digest: 'DIGEST: rho(n) <= 2 for all n; method: two steps.', digestStatus: 'ready' });
   const instant = docs.contextFor('instant');
   check('instant after digest: digest replaces the full text', /\(digest\)/.test(instant) && /DIGEST: rho/.test(instant) && !/# Introduction/.test(instant));
@@ -71,7 +71,8 @@ For every $n$, $\\rho(n) \\le 2$.
 
   // 3. cap
   docs.addText('big', 'x'.repeat(1000));
-  check('cap: truncates to capChars', docs.contextFor('think', { capChars: 100 }).includes('truncated'));
+  const over = docs.contextFor('think', { capChars: 100 });
+  check('cap: a doc that does not fit sends its beginning + is flagged for per-question retrieval', /beginning only/.test(over) && over.length < 400 && docs.partialDocs('think', { capChars: 100 }).length === 1);
 
   console.log(failures ? `\n${failures} FAILED` : '\nALL PASS');
   process.exitCode = failures ? 1 : 0;

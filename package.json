@@ -9,7 +9,7 @@
     "start": "electron .",
     "smoke": "cross-env GHOST_SMOKE=1 electron .",
     "dist": "electron-builder --win portable",
-    "test": "node test/store.test.js && node test/provider-order.test.js && node test/web.test.js && node test/media.test.js && node test/cleanup.test.js && node test/governor.test.js && node test/docs.test.js && node test/mock-gemini.js && node test/mock-openai.js && node test/mock-live.js --selftest && node test/scenario-binary-tree.js",
+    "test": "node test/store.test.js && node test/provider-order.test.js && node test/web.test.js && node test/media.test.js && node test/retrieval.test.js && node test/cleanup.test.js && node test/governor.test.js && node test/docs.test.js && node test/mock-gemini.js && node test/mock-openai.js && node test/mock-live.js --selftest && node test/scenario-binary-tree.js",
     "test:affinity": "powershell -ExecutionPolicy Bypass -File test/affinity-probe.ps1 -Toggle",
     "dist:mac": "electron-builder --mac"
   },

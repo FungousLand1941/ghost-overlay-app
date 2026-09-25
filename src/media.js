@@ -132,11 +132,11 @@ async function ensureRecognizer(onProgress) {
 }
 
 // ---------------------------------------------------------------- file / direct link -> text
-async function transcribeFile(input, { onProgress = () => {}, describeFrame = null, frameEverySec = 60 } = {}) {
+async function transcribeFile(input, { onProgress = () => {}, describeFrames = null, frameEverySec = 30 } = {}) {
   if (!ffmpegPath()) throw new Error('ffmpeg is not bundled in this build');
   onProgress({ text: 'reading the file…' });
   const info = await probe(input);
-  if (!info.hasAudio && !(describeFrame && info.hasVideo)) throw new Error('this file has no audio track');
+  if (!info.hasAudio && !(describeFrames && info.hasVideo)) throw new Error('this file has no audio track');
   const lines = [];
   let warn = '';
   if (info.hasAudio) {
@@ -177,15 +177,18 @@ async function transcribeFile(input, { onProgress = () => {}, describeFrame = nu
     }
   }
   let frames = [];
-  if (describeFrame && info.hasVideo) {
+  if (describeFrames && info.hasVideo) {
+    // every slide/scene change plus a steady cadence; read by the AI six frames at a time
     const shots = await extractFrames(input, { everySec: frameEverySec, onProgress });
-    for (let i = 0; i < shots.length; i++) {
-      onProgress({ text: `describing the screen ${i + 1} / ${shots.length} (${fmtTime(shots[i].t)})` });
+    const B = 6;
+    for (let i = 0; i < shots.length; i += B) {
+      const batch = shots.slice(i, i + B);
+      onProgress({ text: `reading the screen: frames ${i + 1}–${Math.min(shots.length, i + B)} of ${shots.length} (${fmtTime(batch[0].t)})` });
       try {
-        const d = (await describeFrame(shots[i].jpeg.toString('base64'), shots[i].t) || '').trim();
-        if (d && !/^(?:speaker on camera|nothing|blank)\.?$/i.test(d)) frames.push({ t: shots[i].t, text: d });
+        const out = await describeFrames(batch.map((s) => ({ t: s.t, label: fmtTime(s.t), data: s.jpeg.toString('base64') })));
+        for (const [t, txt] of parseFrameNotes(out, batch)) if (txt && !/^(?:speaker on camera|nothing|blank)\.?$/i.test(txt)) frames.push({ t, text: txt });
       } catch (e) {
-        frames.push({ t: shots[i].t, text: `[screen not described: ${e.message}]` });
+        frames.push({ t: batch[0].t, text: `[screen not described: ${e.message}]` });
         if (/quota|rate limit|paused/i.test(e.message)) break;
       }
     }
@@ -195,14 +198,28 @@ async function transcribeFile(input, { onProgress = () => {}, describeFrame = nu
   return { text, seconds: info.seconds, hasVideo: info.hasVideo, lines: lines.length, frames: frames.length };
 }
 
-// One JPEG every `everySec` seconds, near-duplicates dropped (a slide that
-// stays up for five minutes is one frame), with the real timestamps.
-async function extractFrames(input, { everySec = 60, maxFrames = 240, onProgress = () => {} } = {}) {
-  onProgress({ text: 'pulling key frames…' });
+// The AI's per-batch notes come back as "[mm:ss] …" blocks; map each back to its frame.
+function parseFrameNotes(out, batch) {
+  const res = []; let cur = null;
+  const toSec = (s) => s.split(':').reduce((a, b) => a * 60 + (+b), 0);
+  for (const raw of String(out || '').split('\n')) {
+    const m = raw.match(/^\s*\**\[?(\d{1,2}:\d\d(?::\d\d)?)\]?\**\s*[-–:]?\s*(.*)$/);
+    if (m) { const t = toSec(m[1]); const near = batch.reduce((b, s) => (Math.abs(s.t - t) < Math.abs(b.t - t) ? s : b), batch[0]); cur = [near.t, m[2].trim()]; res.push(cur); }
+    else if (cur && raw.trim()) cur[1] += `\n${raw.trim()}`;
+  }
+  if (!res.length && String(out || '').trim()) res.push([batch[0].t, String(out).trim()]);
+  return res;
+}
+
+// One JPEG at every scene/slide change (and at least every `everySec` seconds,
+// never more than one per 2 s), with the real timestamps.
+async function extractFrames(input, { everySec = 30, maxFrames = 400, onProgress = () => {} } = {}) {
+  onProgress({ text: 'finding slide changes and key frames…' });
   const chunks = [];
+  const pick = `select='isnan(prev_selected_t)+gte(t-prev_selected_t\\,2)*(gt(scene\\,0.22)+gte(t-prev_selected_t\\,${everySec}))'`;
   const { stderr } = await run(['-nostdin', '-hide_banner', '-loglevel', 'info', ...inputArgs(input), '-an', '-sn', '-dn',
-    '-vf', `fps=1/${everySec},mpdecimate,scale=768:-2,showinfo`, '-fps_mode', 'vfr', '-frames:v', String(maxFrames),
-    '-f', 'image2pipe', '-vcodec', 'mjpeg', '-q:v', '6', '-'], { onStdout: (c) => { chunks.push(c); } });
+    '-vf', `${pick},scale=1024:-2,showinfo`, '-fps_mode', 'vfr', '-frames:v', String(maxFrames),
+    '-f', 'image2pipe', '-vcodec', 'mjpeg', '-q:v', '5', '-'], { onStdout: (c) => { chunks.push(c); } });
   const buf = Buffer.concat(chunks);
   const times = [...stderr.matchAll(/pts_time:\s*([\d.]+)/g)].map((m) => parseFloat(m[1]));
   const SOI = Buffer.from([0xff, 0xd8, 0xff]), EOI = Buffer.from([0xff, 0xd9]);
@@ -309,4 +326,4 @@ async function youtubeCaptions(url, { onProgress = () => {} } = {}) {
   return { ...info, lang: track.languageCode, auto: track.kind === 'asr', lines, text: lines.map((l) => `[${fmtTime(l.t)}] ${l.text}`).join('\n') };
 }
 
-module.exports = { MEDIA_EXT, isMediaPath, ffmpegPath, fmtTime, probe, run, Segmenter, transcribeFile, extractFrames, killAll, youtubeId, youtubeInfo, youtubeCaptions, parseCaptionTracks, pickTrack, json3ToLines, timedtextToLines };
+module.exports = { MEDIA_EXT, isMediaPath, ffmpegPath, fmtTime, probe, run, Segmenter, transcribeFile, extractFrames, parseFrameNotes, killAll, youtubeId, youtubeInfo, youtubeCaptions, parseCaptionTracks, pickTrack, json3ToLines, timedtextToLines };

@@ -869,7 +869,7 @@
     for (const f of files) {
       const p = window.ghost.pathForFile(f);
       if (!p) { errors.push(`${f.name}: no path`); continue; }
-      const r = await window.ghost.docsAddPath(p, { describeFrames: $('ctx-frames').checked });
+      const r = await window.ghost.docsAddPath(p, frameOpts());
       if (!r.ok) errors.push(`${f.name}: ${r.error}`); else { renderDocs(r.docs); if (r.background) bg++; }
     }
     if (errors.length) toast(errors.join(' | '), true);
@@ -877,7 +877,7 @@
     else if (files.length) toast(`Added ${files.length} document${files.length > 1 ? 's' : ''} — digest generating in the background`);
   }
   $('btn-doc-add').addEventListener('click', async () => {
-    const r = await window.ghost.docsAdd({ describeFrames: $('ctx-frames').checked });
+    const r = await window.ghost.docsAdd(frameOpts());
     renderDocs(r.docs);
     if (r.errors && r.errors.length) toast(r.errors.join(' | '), true);
     else if (r.background) toast(`Transcribing ${r.background} video/audio file${r.background > 1 ? 's' : ''} on this computer — progress shows below`);
@@ -899,13 +899,20 @@
     $('ctx-len').textContent = n ? `(${n.toLocaleString()} chars ≈ ${fmtTokens(n)}${/\\documentclass|\\begin\{document\}/.test($('ctx-text').value) ? ', LaTeX detected — will be cleaned' : ''})` : '';
   }
   $('ctx-text').addEventListener('input', updateCtxLen);
-  function openContext() { el.settings.classList.add('hidden'); $('context').classList.remove('hidden'); window.ghost.docsList().then(renderDocs); setTimeout(() => $('ctx-text').focus(), 50); }
+  function openContext() {
+    el.settings.classList.add('hidden'); $('context').classList.remove('hidden');
+    $('ctx-frames').checked = cfg.videoScreen !== false; $('ctx-frame-sec').value = String(cfg.videoFrameSec || 30);
+    window.ghost.docsList().then(renderDocs); setTimeout(() => $('ctx-text').focus(), 50);
+  }
   $('btn-context').addEventListener('click', openContext);
   $('btn-context-close').addEventListener('click', () => $('context').classList.add('hidden'));
+  const frameOpts = () => ({ describeFrames: $('ctx-frames').checked, frameEverySec: +$('ctx-frame-sec').value || 30 });
+  $('ctx-frames').addEventListener('change', async (e) => { cfg = await window.ghost.setConfig({ videoScreen: e.target.checked }); });
+  $('ctx-frame-sec').addEventListener('change', async (e) => { cfg = await window.ghost.setConfig({ videoFrameSec: +e.target.value || 30 }); });
   async function addUrl(url) {
     url = (url || '').trim();
     if (!URL_RE.test(url)) { toast('That does not look like a link.', true); return; }
-    const r = await window.ghost.docsAddUrl(url, { wholeSite: $('ctx-whole-site').checked, describeFrames: $('ctx-frames').checked });
+    const r = await window.ghost.docsAddUrl(url, { wholeSite: $('ctx-whole-site').checked, ...frameOpts() });
     if (!r.ok) { toast(r.error, true); return; }
     renderDocs(r.docs); $('ctx-url').value = '';
     toast(r.doc.kind === 'web' ? ($('ctx-whole-site').checked ? 'Fetching the site in the background — progress shows below' : 'Fetching the page…') : 'Getting the video in the background — progress shows below');

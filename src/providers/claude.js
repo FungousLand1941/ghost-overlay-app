@@ -9,6 +9,10 @@ function toClaudeMessages(messages) {
     if (m.image?.data) {
       content.push({ type: 'image', source: { type: 'base64', media_type: m.image.mime || 'image/jpeg', data: m.image.data } });
     }
+    for (const im of m.images || []) { // e.g. video frames, each labelled with its timestamp
+      if (im.label) content.push({ type: 'text', text: im.label });
+      content.push({ type: 'image', source: { type: 'base64', media_type: im.mime || 'image/jpeg', data: im.data } });
+    }
     content.push({ type: 'text', text: m.text || (m.image ? 'Here is my screen.' : '') });
     const role = m.role === 'assistant' ? 'assistant' : 'user';
     // Anthropic requires alternating roles; merge consecutive same-role turns.

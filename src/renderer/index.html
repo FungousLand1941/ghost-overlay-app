@@ -258,8 +258,8 @@
       <div id="doc-drop" class="doc-drop"><div>…or drop files (or a link) anywhere on this window</div></div>
       <div class="field"><label>Add from a link <span class="muted">(public web page or whole site · YouTube · direct video/audio link)</span></label>
         <div class="urlrow"><input id="ctx-url" type="text" placeholder="https://…  web page · docs site · YouTube video · file.mp4" /><button id="btn-doc-url" class="btn primary">Fetch</button></div>
-        <label class="small opt"><input type="checkbox" id="ctx-whole-site" checked /> Web links: fetch the <b>whole site</b> (follow same-site links, up to 40 pages)</label>
-        <label class="small opt"><input type="checkbox" id="ctx-frames" /> Videos: also describe what's <b>on screen</b> (slides, code) — about 1 AI request per minute of video</label>
+        <label class="small opt"><input type="checkbox" id="ctx-whole-site" checked /> Web links: fetch the <b>whole site</b> (follow same-site links, up to 200 pages; each answer gets the pages relevant to the question)</label>
+        <label class="small opt"><input type="checkbox" id="ctx-frames" checked /> Videos: read what's <b>on screen</b> with the answering AI — at every slide change, plus at least every <select id="ctx-frame-sec"><option value="15">15 s</option><option value="30" selected>30 s</option><option value="60">60 s</option></select> (6 frames per request ≈ 1 request per 3 min of video)</label>
         <div id="ctx-progress" class="small ctx-progress hidden"></div>
       </div>
       <div class="field"><label>Saved context <span id="ctx-total" class="muted"></span></label>

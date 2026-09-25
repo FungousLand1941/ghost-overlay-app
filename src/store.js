@@ -35,6 +35,8 @@ const DEFAULTS = {
   customPrompt: '',
   maxTokens: 4096,
   screenshotMaxEdge: 1280,      // smaller = fewer vision tokens = faster Ask
+  videoScreen: true,            // videos added to Context: read what's on screen with the answering AI
+  videoFrameSec: 30,            // …at every scene change plus at least every N seconds
   speed: 'fast',                // legacy; see mode / thinkSpeed
   mode: 'instant',              // 'instant' (small model, no thinking, ~80 words) | 'think' (full model + thinking)
   instantModel: { gemini: 'gemini-2.5-flash-lite', claude: 'claude-haiku-4-5' },

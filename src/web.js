@@ -3,8 +3,8 @@
 // offscreen renderer the main process supplies (render(url) -> {title,text,links}).
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 const MAX_PAGE_CHARS = 150000;
-const DEFAULT_MAX_PAGES = 40;
-const DEFAULT_MAX_CHARS = 400000; // matches docs.MAX_DOC_CHARS
+const DEFAULT_MAX_PAGES = 200;
+const DEFAULT_MAX_CHARS = 2000000; // matches docs.MAX_DOC_CHARS
 const MAX_BODY_BYTES = 40 * 1024 * 1024;
 const SKIP_EXT = /\.(?:png|jpe?g|gif|webp|avif|svg|ico|bmp|tiff?|mp4|m4v|mkv|webm|mov|avi|mp3|m4a|wav|ogg|flac|zip|gz|tgz|bz2|7z|rar|dmg|exe|msi|apk|css|js|mjs|map|woff2?|ttf|otf|eot|rss|atom)(?:[?#].*)?$/i;
 

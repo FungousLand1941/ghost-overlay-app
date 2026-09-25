@@ -17,13 +17,14 @@ function toMessages(messages, system, allowImages) {
   let dropped = false;
   for (const m of messages) {
     const role = m.role === 'assistant' ? 'assistant' : 'user';
-    if (m.image?.data && allowImages) {
-      out.push({ role, content: [
-        { type: 'image_url', image_url: { url: `data:${m.image.mime || 'image/jpeg'};base64,${m.image.data}` } },
-        { type: 'text', text: m.text || 'Here is my screen.' },
-      ] });
+    const imgs = [...(m.image?.data ? [m.image] : []), ...(m.images || [])];
+    if (imgs.length && allowImages) {
+      const content = [];
+      for (const im of imgs) { if (im.label) content.push({ type: 'text', text: im.label }); content.push({ type: 'image_url', image_url: { url: `data:${im.mime || 'image/jpeg'};base64,${im.data}` } }); }
+      content.push({ type: 'text', text: m.text || 'Here is my screen.' });
+      out.push({ role, content });
     } else {
-      out.push({ role, content: (m.text || '') + (m.image?.data && !allowImages ? (dropped = true, '\n[screenshot omitted: this model has no vision]') : '') });
+      out.push({ role, content: (m.text || '') + (imgs.length && !allowImages ? (dropped = true, '\n[screenshot omitted: this model has no vision]') : '') });
     }
   }
   return { out, dropped };
