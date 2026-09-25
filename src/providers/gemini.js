@@ -18,9 +18,9 @@ function toGeminiContents(messages) {
 
 const FIRST_BYTE_TIMEOUT_MS = 15000; // an overloaded model can hang for a minute; we'd rather try the next one
 
-async function request(apiKey, model, method, body, signal) {
+async function request(apiKey, model, method, body, signal, timeoutMs = FIRST_BYTE_TIMEOUT_MS) {
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(new Error('timeout')), FIRST_BYTE_TIMEOUT_MS);
+  const timer = setTimeout(() => ac.abort(new Error('timeout')), timeoutMs);
   if (signal) signal.addEventListener('abort', () => ac.abort(signal.reason), { once: true });
   let res;
   try {
@@ -33,7 +33,7 @@ async function request(apiKey, model, method, body, signal) {
   } catch (e) {
     clearTimeout(timer);
     if (signal && signal.aborted) throw e;
-    const err = new Error(`Gemini: ${model} did not respond within ${FIRST_BYTE_TIMEOUT_MS / 1000}s`);
+    const err = new Error(`Gemini: ${model} did not respond within ${timeoutMs / 1000}s`);
     err.code = 'OVERLOADED'; err.model = model;
     throw err;
   }
@@ -214,4 +214,33 @@ async function transcribe({ apiKey, model: wantedModel, wavBase64, context }) {
   return text;
 }
 
-module.exports = { stream, transcribe, listModels, resolveModel, pickAvailable, PREFERRED, onModelResolved: null };
+// Gemini can read a public YouTube video straight from its URL (free tier: ~8 h of video a day).
+const VIDEO_PROMPTS = {
+  full: `Watch this whole video. Output plain text in this order:
+1. TRANSCRIPT — everything said, as [mm:ss] timestamped lines, verbatim (drop filler words only). If the video is longer than ~40 minutes, keep the first 30 minutes verbatim and condense the rest densely (every point, term and number, fewer words).
+2. ON SCREEN — timestamped list of what appears on screen that matters: slide titles and bullet text (verbatim), code, equations, diagrams (describe), captions. Skip the presenter's face.
+3. KEY FACTS — dense bullets: every fact, definition, number, name and conclusion in the video.`,
+  screen: `Watch this whole video and list, as [mm:ss] timestamped plain-text lines, what appears ON SCREEN that carries information: slide titles and bullet text (verbatim), code, equations, diagrams (describe concretely), captions and names. Skip frames that only show the presenter. Then add KEY FACTS: dense bullets of every fact, definition, number and conclusion.`,
+};
+function pickVideoModel(available, wanted) {
+  const ok = (m) => /^gemini-.*flash/.test(m) && !/live|tts|image|audio|embedding|8b/.test(m);
+  if (!available || !available.length) return wanted && ok(wanted) ? wanted : 'gemini-2.5-flash';
+  if (wanted && ok(wanted) && available.includes(wanted)) return wanted;
+  return ['gemini-2.5-flash', 'gemini-3.1-flash', 'gemini-3-flash', 'gemini-3-flash-preview', 'gemini-2.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3-flash-lite', 'gemini-2.0-flash'].find((m) => available.includes(m))
+    || available.find(ok) || 'gemini-2.5-flash';
+}
+async function videoFromUrl({ apiKey, url, model: wanted, mode = 'full', prompt }) {
+  const model = pickVideoModel(await listModels(apiKey), wanted);
+  const generationConfig = { maxOutputTokens: 8192, temperature: 0.2 };
+  if (/2\.5-flash/.test(model)) generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  const res = await request(apiKey, model, 'generateContent', {
+    contents: [{ role: 'user', parts: [{ fileData: { fileUri: url } }, { text: prompt || VIDEO_PROMPTS[mode] || VIDEO_PROMPTS.full }] }],
+    generationConfig,
+  }, null, 300000);
+  const j = await res.json();
+  const text = (j.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').trim();
+  if (!text) throw new Error(`Gemini returned nothing for that video (${j.candidates?.[0]?.finishReason || (j.promptFeedback && j.promptFeedback.blockReason) || 'no candidates'})`);
+  return { model, text };
+}
+
+module.exports = { stream, transcribe, videoFromUrl, pickVideoModel, listModels, resolveModel, pickAvailable, PREFERRED, onModelResolved: null };

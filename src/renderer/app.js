@@ -828,27 +828,34 @@
 
   // ---- document library ----
   let docList = [];
+  const URL_RE = /^(?:https?:\/\/)?(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d+)?(?:\/\S*)?$/i;
+  const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  function fmtClock(sec) { sec = Math.round(sec || 0); const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60; return (h ? `${h}:` : '') + `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`; }
   function fmtTokens(chars) { const t = Math.round(chars / 4); return t >= 1000 ? `${(t / 1000).toFixed(t >= 10000 ? 0 : 1)}k tok` : `${t} tok`; }
   function renderDocs(list) {
     docList = list || docList;
     const box = $('doc-list');
     box.innerHTML = '';
-    const on = docList.filter((d) => d.enabled);
+    const on = docList.filter((d) => d.enabled && !d.processing);
     const badge = $('ctx-count');
     badge.textContent = on.length; badge.classList.toggle('hidden', !on.length);
     $('ctx-total').textContent = on.length ? `(${on.length} item${on.length > 1 ? 's' : ''}, ${fmtTokens(on.reduce((n, d) => n + d.chars, 0))} full text · always included)` : '';
-    if (!docList.length) { box.innerHTML = '<div class="muted small">Nothing saved yet — paste above or drop a file.</div>'; return; }
+    if (!docList.length) { box.innerHTML = '<div class="muted small">Nothing saved yet — paste above, drop a file, or fetch a link / video.</div>'; return; }
     for (const d of docList) {
       const row = document.createElement('div');
       row.className = 'doc' + (d.enabled ? '' : ' off');
-      const st = d.digestStatus === 'ready' ? '<span class="ok">digest ready</span>'
+      const st = d.processing ? `<span class="working">${esc(d.processing)}</span>`
+        : d.error ? `<span class="failed" title="${esc(d.error)}">failed — ${esc(d.error.slice(0, 70))}</span>`
+        : d.digestStatus === 'ready' ? '<span class="ok">digest ready</span>'
         : d.digestStatus === 'working' ? '<span class="working">digesting…</span>'
         : d.digestStatus === 'pending' ? '<span class="working">digest queued</span>'
-        : d.digestStatus === 'failed' ? `<span class="failed" title="${(d.digestError || '').replace(/"/g, '&quot;')}">digest failed</span>`
+        : d.digestStatus === 'failed' ? `<span class="failed" title="${esc(d.digestError)}">digest failed</span>`
         : 'short — sent in full';
+      const extra = d.kind === 'web' && d.pages ? ` · ${d.pages} page${d.pages > 1 ? 's' : ''}` : d.pages ? ` · ${d.pages} p` : d.seconds ? ` · ${fmtClock(d.seconds)}` : '';
+      const size = d.processing ? '' : ` · ${fmtTokens(d.chars)}${d.truncated ? ' (truncated)' : ''}`;
       row.innerHTML = `<input type="checkbox" ${d.enabled ? 'checked' : ''} title="Include in context" />
-        <span class="doc-name" title="${d.name}">${d.name}</span>
-        <span class="doc-meta">${d.kind}${d.pages ? ` · ${d.pages} p` : ''} · ${fmtTokens(d.chars)}${d.truncated ? ' (truncated)' : ''} · ${st}</span>
+        <span class="doc-name" title="${esc(d.source || d.name)}">${esc(d.name)}</span>
+        <span class="doc-meta">${d.kind}${extra}${size} · ${st}</span>
         <button class="btn" data-act="digest" title="Regenerate digest">↻</button>
         <button class="btn" data-act="remove" title="Remove">✕</button>`;
       row.querySelector('input').addEventListener('change', async (e) => { renderDocs(await window.ghost.docsToggle(d.id, e.target.checked)); });
@@ -858,23 +865,27 @@
     }
   }
   async function addDocFiles(files) {
-    const errors = [];
+    const errors = []; let bg = 0;
     for (const f of files) {
       const p = window.ghost.pathForFile(f);
       if (!p) { errors.push(`${f.name}: no path`); continue; }
-      const r = await window.ghost.docsAddPath(p);
-      if (!r.ok) errors.push(`${f.name}: ${r.error}`); else renderDocs(r.docs);
+      const r = await window.ghost.docsAddPath(p, { describeFrames: $('ctx-frames').checked });
+      if (!r.ok) errors.push(`${f.name}: ${r.error}`); else { renderDocs(r.docs); if (r.background) bg++; }
     }
-    if (errors.length) toast(errors.join(' | '), true); else if (files.length) toast(`Added ${files.length} document${files.length > 1 ? 's' : ''} — digest generating in the background`);
+    if (errors.length) toast(errors.join(' | '), true);
+    else if (bg) toast(`Transcribing ${bg} video/audio file${bg > 1 ? 's' : ''} on this computer — progress shows in the Context tab`);
+    else if (files.length) toast(`Added ${files.length} document${files.length > 1 ? 's' : ''} — digest generating in the background`);
   }
   $('btn-doc-add').addEventListener('click', async () => {
-    const r = await window.ghost.docsAdd();
+    const r = await window.ghost.docsAdd({ describeFrames: $('ctx-frames').checked });
     renderDocs(r.docs);
     if (r.errors && r.errors.length) toast(r.errors.join(' | '), true);
+    else if (r.background) toast(`Transcribing ${r.background} video/audio file${r.background > 1 ? 's' : ''} on this computer — progress shows below`);
     else if (r.added.length) toast(`Added ${r.added.length} document${r.added.length > 1 ? 's' : ''} — digest generating in the background`);
   });
   $('btn-doc-paste').addEventListener('click', async () => {
     const text = $('ctx-text').value.trim();
+    if (URL_RE.test(text)) { $('ctx-text').value = ''; updateCtxLen(); addUrl(text); return; }
     if (text.length < 20) { toast('Paste something first.', true); return; }
     const guess = (text.match(/\\title\{([^}]*)\}/) || [])[1] || (text.match(/^#\s+(.+)$/m) || [])[1] || '';
     const name = $('ctx-name').value.trim() || guess.trim() || `pasted ${new Date().toLocaleString()}`;
@@ -891,6 +902,16 @@
   function openContext() { el.settings.classList.add('hidden'); $('context').classList.remove('hidden'); window.ghost.docsList().then(renderDocs); setTimeout(() => $('ctx-text').focus(), 50); }
   $('btn-context').addEventListener('click', openContext);
   $('btn-context-close').addEventListener('click', () => $('context').classList.add('hidden'));
+  async function addUrl(url) {
+    url = (url || '').trim();
+    if (!URL_RE.test(url)) { toast('That does not look like a link.', true); return; }
+    const r = await window.ghost.docsAddUrl(url, { wholeSite: $('ctx-whole-site').checked, describeFrames: $('ctx-frames').checked });
+    if (!r.ok) { toast(r.error, true); return; }
+    renderDocs(r.docs); $('ctx-url').value = '';
+    toast(r.doc.kind === 'web' ? ($('ctx-whole-site').checked ? 'Fetching the site in the background — progress shows below' : 'Fetching the page…') : 'Getting the video in the background — progress shows below');
+  }
+  $('btn-doc-url').addEventListener('click', () => addUrl($('ctx-url').value));
+  $('ctx-url').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addUrl($('ctx-url').value); } });
   // drag & drop anywhere on the window
   const drop = $('doc-drop');
   document.addEventListener('dragover', (e) => { e.preventDefault(); document.body.classList.add('dropping'); drop.classList.add('over'); });
@@ -898,9 +919,16 @@
   document.addEventListener('drop', (e) => {
     e.preventDefault(); document.body.classList.remove('dropping'); drop.classList.remove('over');
     const files = [...(e.dataTransfer?.files || [])];
-    if (files.length) { openContext(); addDocFiles(files); }
+    if (files.length) { openContext(); addDocFiles(files); return; }
+    const link = ((e.dataTransfer?.getData('text/uri-list') || e.dataTransfer?.getData('text/plain') || '').trim().split('\n')[0] || '').trim();
+    if (link && URL_RE.test(link)) { openContext(); addUrl(link); }
   });
-  window.ghost.onDocsEvent((ev) => { if (ev.type === 'update') renderDocs(ev.docs); });
+  window.ghost.onDocsEvent((ev) => {
+    const prog = $('ctx-progress');
+    if (ev.type === 'update') { renderDocs(ev.docs); if (!ev.docs.some((d) => d.processing)) prog.classList.add('hidden'); }
+    else if (ev.type === 'progress') { prog.textContent = ev.text; prog.classList.remove('hidden'); const d = docList.find((x) => x.id === ev.id); if (d) { d.processing = ev.text; renderDocs(); } }
+    else if (ev.type === 'error') toast(ev.text, true);
+  });
 
   function updateDocsCount() {
     const n = $('s-docs').value.length;

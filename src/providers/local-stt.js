@@ -149,17 +149,34 @@ function startRefiner() {
     refiner.on('message', (m) => {
       if (m.type === 'ready') { refineState = 'ready'; onRefineLog(`accuracy pass ready (${REFINE_MODEL.id}, load ${m.ms} ms)`); resolve(); return; }
       if (m.type === 'init-error') { refineState = 'failed'; onRefineLog(`accuracy pass failed to load: ${m.error}`); reject(new Error(m.error)); return; }
-      const p = pendingRefine.get(m.uid); if (!p) return;
+      const p = pendingRefine.get(m.uid);
+      if (!p) { // not a live utterance: a file segment (video/audio context)
+        const f = pendingFile.get(m.uid);
+        if (f) { pendingFile.delete(m.uid); if (m.type === 'refined') f.resolve((m.text || '').trim()); else f.reject(new Error(m.error || 'recognition failed')); }
+        return;
+      }
       pendingRefine.delete(m.uid);
       if (m.type === 'refined') p.t.emit('revise', { uid: m.uid, text: m.text, ms: m.ms, seconds: m.seconds });
       else p.t.emit('revise', { uid: m.uid, text: '', error: m.error });
     });
-    refiner.on('error', (e) => { refineState = 'failed'; onRefineLog(`accuracy worker crashed: ${e.message}`); for (const [uid, p] of pendingRefine) p.t.emit('revise', { uid, text: '', error: e.message }); pendingRefine.clear(); reject(e); });
-    refiner.on('exit', () => { refiner = null; if (refineState !== 'failed') refineState = 'idle'; refinePromise = null; });
+    refiner.on('error', (e) => { refineState = 'failed'; onRefineLog(`accuracy worker crashed: ${e.message}`); for (const [uid, p] of pendingRefine) p.t.emit('revise', { uid, text: '', error: e.message }); pendingRefine.clear(); failFiles(e); reject(e); });
+    refiner.on('exit', () => { refiner = null; if (refineState !== 'failed') refineState = 'idle'; refinePromise = null; failFiles(new Error('speech recogniser exited')); });
     refiner.postMessage({ type: 'init', modelDir: modelDir(REFINE_MODEL), files: REFINE_MODEL.files, modelType: REFINE_MODEL.modelType });
     setTimeout(() => { if (refineState === 'loading') { refineState = 'failed'; reject(new Error(`accuracy model load timed out after ${Date.now() - t0} ms`)); } }, 120000);
   });
   return refinePromise;
+}
+// Whole-file recognition (video / audio context): same accuracy model, one segment at a time.
+const pendingFile = new Map(); // uid -> { resolve, reject }
+let fileUid = 0;
+function failFiles(err) { for (const f of pendingFile.values()) f.reject(err); pendingFile.clear(); }
+async function transcribeSamples(samples) {
+  await startRefiner();
+  return new Promise((resolve, reject) => {
+    const uid = `file${++fileUid}`;
+    pendingFile.set(uid, { resolve, reject });
+    refiner.postMessage({ type: 'refine', uid, samples, sampleRate: 16000 }, [samples.buffer]);
+  });
 }
 function refine(t, uid, audio) {
   if (refineState === 'failed') return;
@@ -168,7 +185,7 @@ function refine(t, uid, audio) {
   if (refineState === 'ready') send(); else startRefiner().then(send, () => { pendingRefine.delete(uid); t.emit('revise', { uid, text: '', error: 'refiner unavailable' }); });
 }
 function refinePending() { return pendingRefine.size; }
-function shutdownRefiner() { try { refiner?.terminate(); } catch {} refiner = null; refineState = 'idle'; refinePromise = null; pendingRefine.clear(); }
+function shutdownRefiner() { try { refiner?.terminate(); } catch {} refiner = null; refineState = 'idle'; refinePromise = null; pendingRefine.clear(); failFiles(new Error('speech recogniser shut down')); }
 
 // Load the models in the background at app start so a mid-call fallback is instant.
 async function warmUp() { if (!modelReady()) return false; try { await startWorker(); return true; } catch { return false; } }
@@ -220,4 +237,4 @@ class LocalTranscriber extends EventEmitter {
   }
 }
 
-module.exports = { LocalTranscriber, init, ensureModel, modelReady, modelInfo, warmUp, shutdown, setModel, setRefine, refinePending, MODELS, REFINE_MODEL, DEFAULT_MODEL, get MODEL() { return MODEL; }, get refineState() { return refineState; }, set onRefineLog(f) { onRefineLog = f; } };
+module.exports = { LocalTranscriber, init, ensureModel, modelReady, modelInfo, warmUp, shutdown, setModel, setRefine, refinePending, transcribeSamples, startRefiner, MODELS, REFINE_MODEL, DEFAULT_MODEL, get MODEL() { return MODEL; }, get refineState() { return refineState; }, set onRefineLog(f) { onRefineLog = f; } };

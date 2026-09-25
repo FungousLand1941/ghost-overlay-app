@@ -37,8 +37,9 @@ contextBridge.exposeInMainWorld('ghost', {
 
   // document library
   docsList: () => ipcRenderer.invoke('docs:list'),
-  docsAdd: () => ipcRenderer.invoke('docs:add'),                 // file picker
-  docsAddPath: (p) => ipcRenderer.invoke('docs:addPath', p),     // drag & drop / tests
+  docsAdd: (opts) => ipcRenderer.invoke('docs:add', opts || {}), // file picker
+  docsAddPath: (p, opts) => ipcRenderer.invoke('docs:addPath', opts ? { p, opts } : p), // drag & drop / tests
+  docsAddUrl: (url, opts) => ipcRenderer.invoke('docs:addUrl', { url, opts: opts || {} }), // web page / whole site / YouTube / media link
   docsAddText: (name, text) => ipcRenderer.invoke('docs:addText', { name, text }),
   docsToggle: (id, enabled) => ipcRenderer.invoke('docs:toggle', { id, enabled }),
   docsRemove: (id) => ipcRenderer.invoke('docs:remove', id),

@@ -247,15 +247,21 @@
       <button id="btn-context-close" class="btn">✕</button>
     </div>
     <div class="settings-body">
-      <div class="muted small">Paste a paper (LaTeX is fine — it's cleaned, maths kept), a spec, your résumé, a job description, notes… Saved to disk and included in <b>every</b> answer from now on. 🧠 Think uses the full text; ⚡ Instant uses an auto-made digest so it stays fast.</div>
+      <div class="muted small">Paste a paper (LaTeX is fine — it's cleaned, maths kept), a spec, your résumé, a job description, notes… Saved to disk and included in <b>every</b> answer from now on. 🧠 Think uses the full text; ⚡ Instant uses an auto-made digest so it stays fast. Links and videos work too: a public web page (or the whole site), a YouTube video, or a video/audio file — videos are transcribed on this computer for free.</div>
       <div class="field"><label>Name (optional)</label><input id="ctx-name" type="text" placeholder="e.g. My paper — barriers" /></div>
       <div class="field"><label>Paste here <span id="ctx-len" class="muted"></span></label>
         <textarea id="ctx-text" rows="10" placeholder="Paste the whole thing. \documentclass … \end{document} works as-is."></textarea></div>
       <div class="settings-actions">
         <button id="btn-doc-paste" class="btn primary">Save to context</button>
-        <button id="btn-doc-add" class="btn">Add files… (.tex .pdf .docx .md .txt)</button>
+        <button id="btn-doc-add" class="btn">Add files… (.pdf .docx .tex .md .txt · video/audio .mp4 .mkv .mp3 …)</button>
       </div>
-      <div id="doc-drop" class="doc-drop"><div>…or drop files anywhere on this window</div></div>
+      <div id="doc-drop" class="doc-drop"><div>…or drop files (or a link) anywhere on this window</div></div>
+      <div class="field"><label>Add from a link <span class="muted">(public web page or whole site · YouTube · direct video/audio link)</span></label>
+        <div class="urlrow"><input id="ctx-url" type="text" placeholder="https://…  web page · docs site · YouTube video · file.mp4" /><button id="btn-doc-url" class="btn primary">Fetch</button></div>
+        <label class="small opt"><input type="checkbox" id="ctx-whole-site" checked /> Web links: fetch the <b>whole site</b> (follow same-site links, up to 40 pages)</label>
+        <label class="small opt"><input type="checkbox" id="ctx-frames" /> Videos: also describe what's <b>on screen</b> (slides, code) — about 1 AI request per minute of video</label>
+        <div id="ctx-progress" class="small ctx-progress hidden"></div>
+      </div>
       <div class="field"><label>Saved context <span id="ctx-total" class="muted"></span></label>
         <div id="doc-list" class="doc-list"></div></div>
     </div>

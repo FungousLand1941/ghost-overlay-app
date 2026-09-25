@@ -539,22 +539,154 @@ async function addDocFromPath(p) {
   return entry;
 }
 ipcMain.handle('docs:list', () => docs.list());
-ipcMain.handle('docs:add', async () => {
+ipcMain.handle('docs:add', async (_e, opts = {}) => {
   const r = await dialog.showOpenDialog(win, {
-    title: 'Add background documents',
+    title: 'Add background documents, videos or audio',
     properties: ['openFile', 'multiSelections'],
-    filters: [{ name: 'Documents', extensions: ['tex', 'md', 'txt', 'pdf', 'docx', 'json', 'csv', 'html', 'bib'] }, { name: 'All files', extensions: ['*'] }],
+    filters: [{ name: 'Documents & media', extensions: ['tex', 'md', 'txt', 'pdf', 'docx', 'json', 'csv', 'html', 'bib', ...media.MEDIA_EXT] }, { name: 'Video / audio', extensions: media.MEDIA_EXT }, { name: 'All files', extensions: ['*'] }],
   });
   if (r.canceled) return { added: [], docs: docs.list() };
-  const added = []; const errors = [];
-  for (const p of r.filePaths) { try { added.push(await addDocFromPath(p)); } catch (e) { errors.push(`${path.basename(p)}: ${e.message}`); } }
-  return { added, errors, docs: docs.list() };
+  const added = []; const errors = []; let background = 0;
+  for (const p of r.filePaths) {
+    try { if (media.isMediaPath(p)) { added.push(startMediaDoc(p, opts)); background++; } else added.push(await addDocFromPath(p)); }
+    catch (e) { errors.push(`${path.basename(p)}: ${e.message}`); }
+  }
+  return { added, errors, background, docs: docs.list() };
 });
-ipcMain.handle('docs:addPath', async (_e, p) => { try { return { ok: true, doc: await addDocFromPath(p), docs: docs.list() }; } catch (e) { return { ok: false, error: e.message, docs: docs.list() }; } });
+ipcMain.handle('docs:addPath', async (_e, arg) => {
+  const p = typeof arg === 'string' ? arg : (arg && arg.p); const opts = (arg && arg.opts) || {};
+  try {
+    if (media.isMediaPath(p)) return { ok: true, doc: startMediaDoc(p, opts), docs: docs.list(), background: true };
+    return { ok: true, doc: await addDocFromPath(p), docs: docs.list() };
+  } catch (e) { return { ok: false, error: e.message, docs: docs.list() }; }
+});
 ipcMain.handle('docs:addText', async (_e, { name, text }) => { const d = docs.addText(name || 'pasted text', text); runPendingDigests(); return { ok: true, doc: d, docs: docs.list() }; });
 ipcMain.handle('docs:toggle', (_e, { id, enabled }) => { docs.update(id, { enabled: !!enabled }); if (enabled) runPendingDigests(); return docs.list(); });
 ipcMain.handle('docs:remove', (_e, id) => docs.remove(id));
 ipcMain.handle('docs:digest', (_e, id) => { docs.update(id, { digestStatus: 'pending', digest: '' }); runPendingDigests(); return docs.list(); });
+
+// ---- links & videos as context ----
+// Web pages / whole sites are fetched and stripped to text; videos and audio are
+// transcribed on this machine (bundled ffmpeg + the offline Parakeet recogniser);
+// YouTube uses the caption track, or Gemini reads the video when there is none.
+const web = require('./src/web');
+const media = require('./src/media');
+const gemini = require('./src/providers/gemini');
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function docProgress(id, text) { docs.update(id, { processing: text }); send('docs:event', { type: 'progress', id, text }); }
+function docsChanged() { send('docs:event', { type: 'update', docs: docs.list() }); }
+function docFailed(entry, err, what) {
+  log(`[docs] ${what} failed`, entry.name, err.message);
+  docs.update(entry.id, { processing: null, error: err.message });
+  send('docs:event', { type: 'error', id: entry.id, text: `${entry.name}: ${err.message}` });
+}
+
+// JavaScript-only sites: load them in a hidden window and read the rendered text.
+async function renderPage(url) {
+  const { BrowserWindow, session } = require('electron');
+  const ses = session.fromPartition('ghost-fetch'); // in-memory, separate cookies
+  if (!ses._ghostNoDownloads) { ses._ghostNoDownloads = true; ses.on('will-download', (e) => e.preventDefault()); }
+  const w = new BrowserWindow({ show: false, width: 1280, height: 900, webPreferences: { session: ses, sandbox: true, contextIsolation: true, nodeIntegration: false, images: false, backgroundThrottling: false } });
+  try {
+    w.webContents.setAudioMuted(true);
+    w.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    await Promise.race([w.loadURL(url, { userAgent: web.UA }).catch((e) => { if (!/ERR_ABORTED/.test(e.message)) throw e; }), sleep(25000)]);
+    await sleep(1500);
+    return await w.webContents.executeJavaScript('(() => ({ title: document.title, url: location.href, text: document.body ? document.body.innerText : "", links: [...document.querySelectorAll("a[href]")].map((a) => a.href) }))()', true);
+  } finally { try { w.destroy(); } catch {} }
+}
+
+// Describe one video frame with the answering AI (opt-in "what's on screen" pass; throttled by the governor).
+const FRAME_PROMPT = 'This is one frame from a video the user wants to study. In at most 4 short lines, state what is on screen that carries information: copy slide titles, bullet text, code, equations and captions verbatim; describe diagrams/whiteboards concretely. If it is only a person talking or a blank/transition frame, reply exactly: speaker on camera';
+function frameDescriber(cfg) {
+  return async (jpegBase64) => {
+    for (let attempt = 0; ; attempt++) {
+      const blocked = gate('digest');
+      if (!blocked) break;
+      if (attempt >= 6) throw new Error(blocked);
+      await sleep(30000);
+    }
+    let out = '';
+    for await (const t of providers.stream(providers.modeConfig(cfg, 'instant'), { messages: [{ role: 'user', text: FRAME_PROMPT, image: { data: jpegBase64, mime: 'image/jpeg' } }], system: 'You turn video frames into study notes. Be concrete and brief; copy visible text verbatim.' })) out += t;
+    return out.trim();
+  };
+}
+
+// One media job at a time (ffmpeg + the recogniser are heavy). The entry appears at once and fills in when done.
+let mediaChain = Promise.resolve();
+function startMediaDoc(input, { describeFrames = false, name = null } = {}) {
+  const isUrl = /^https?:\/\//i.test(input);
+  const entry = docs.addEntry({ name: name || (isUrl ? decodeURIComponent(input.split('/').pop().split('?')[0]) || input : path.basename(input)), kind: 'video', source: input, processing: 'queued…' });
+  docsChanged();
+  mediaChain = mediaChain.then(async () => {
+    if (!docs.get(entry.id)) return; // removed while queued
+    const cfg = store.get();
+    try {
+      const r = await media.transcribeFile(input, { onProgress: (p) => docProgress(entry.id, p.text), describeFrame: describeFrames ? frameDescriber(cfg) : null, frameEverySec: 60 });
+      if (!docs.get(entry.id)) return;
+      const head = `# ${entry.name}\nSource: ${input}\nDuration: ${media.fmtTime(r.seconds)} · transcribed on this computer (${localStt.REFINE_MODEL.id})${r.frames ? ' · on-screen notes about every 60 s' : ''}\n\n`;
+      docs.setText(entry.id, head + r.text, { kind: r.hasVideo ? 'video' : 'audio', seconds: r.seconds });
+      log('[docs] media ready', entry.name, `${r.lines} lines, ${r.frames} frames, ${media.fmtTime(r.seconds)}`);
+      runPendingDigests();
+    } catch (e) { docFailed(entry, e, 'media'); }
+    docsChanged();
+  });
+  return entry;
+}
+
+// YouTube: captions are free and exact; without them (or for on-screen notes) Gemini reads the video itself.
+async function youtubeDoc(c, onProgress, describeFrames) {
+  const cfg = store.get();
+  const gkey = cfg.gemini?.apiKey;
+  let caps = null, capErr = null;
+  try { caps = await media.youtubeCaptions(c.url, { onProgress }); } catch (e) { capErr = e; }
+  const info = (caps || (capErr && capErr.info)) || {};
+  const title = info.title || `YouTube ${c.id}`;
+  const parts = [];
+  if (caps) parts.push(`## Transcript (${caps.auto ? 'auto-generated captions' : 'captions'}, ${caps.lang})\n${caps.text}`);
+  if (gkey && (!caps || describeFrames)) {
+    const blocked = gate('digest'); if (blocked) throw new Error(blocked);
+    onProgress({ text: `asking Gemini to ${caps ? 'describe what is on screen' : 'watch the video'} (can take a minute or two)…` });
+    const g = await gemini.videoFromUrl({ apiKey: gkey, url: c.url, model: cfg.gemini?.model, mode: caps ? 'screen' : 'full' });
+    parts.push(`## ${caps ? 'On screen' : 'Transcript and notes'} (Gemini ${g.model})\n${g.text}`);
+  } else if (!caps) {
+    throw new Error(`${capErr.message}. Add a Gemini API key (Gemini can watch YouTube directly), or download the video and drop the file here.`);
+  }
+  const head = `# ${title}\nSource: ${c.url}${info.seconds ? `\nDuration: ${media.fmtTime(info.seconds)}` : ''}\n\n`;
+  return { text: head + parts.join('\n\n'), patch: { name: title, kind: 'video', seconds: info.seconds || null } };
+}
+
+function startUrlDoc(url, { wholeSite = true, describeFrames = false } = {}) {
+  const c = web.classifyUrl(url);
+  if (c.kind === 'media') return startMediaDoc(c.url, { describeFrames });
+  const entry = docs.addEntry({ name: c.kind === 'youtube' ? `YouTube ${c.id}` : c.url, kind: c.kind === 'youtube' ? 'video' : 'web', source: c.url, processing: 'starting…' });
+  docsChanged();
+  (async () => {
+    const onProgress = (p) => docProgress(entry.id, p.text);
+    try {
+      let text, patch;
+      if (c.kind === 'youtube') ({ text, patch } = await youtubeDoc(c, onProgress, describeFrames));
+      else {
+        const r = await web.fetchSite(c.url, { wholeSite, render: renderPage, onProgress });
+        text = r.text; patch = { name: r.name, pages: r.pages, kind: 'web' };
+      }
+      if (!docs.get(entry.id)) return;
+      docs.setText(entry.id, text, patch);
+      log('[docs] link ready', patch.name || entry.name, `${text.length} chars`);
+      runPendingDigests();
+    } catch (e) { docFailed(entry, e, 'link'); }
+    docsChanged();
+  })();
+  return entry;
+}
+
+ipcMain.handle('docs:addUrl', (_e, { url, opts } = {}) => {
+  const u = String(url || '').trim();
+  if (!u || !(web.looksLikeUrl(u) || /^https?:\/\//i.test(u))) return { ok: false, error: 'That does not look like a link.', docs: docs.list() };
+  try { return { ok: true, doc: startUrlDoc(u, opts || {}), docs: docs.list(), background: true }; }
+  catch (e) { return { ok: false, error: e.message, docs: docs.list() }; }
+});
+app.on('will-quit', () => media.killAll());
 app.whenReady().then(() => setTimeout(runPendingDigests, 3000));
 // Warm the local speech engine in its worker thread shortly after launch (if the
 // model is on disk) so a mid-call fallback from Gemini Live is instant.

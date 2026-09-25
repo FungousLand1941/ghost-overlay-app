@@ -232,3 +232,9 @@ body.dropping .panel { outline: 2px dashed var(--accent); outline-offset: -4px; 
 .df-bar > span { display: block; height: 100%; width: 0; background: var(--fg-dim); transition: width .06s linear; }
 .df-bar > span.hot { background: var(--ok); }
 .df-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Context: add-from-link */
+.urlrow { display: flex; gap: 6px; }
+.urlrow input { flex: 1; min-width: 0; }
+.field label.opt { display: block; margin-top: 4px; color: var(--fg-dim); }
+.ctx-progress { color: var(--warn); margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
