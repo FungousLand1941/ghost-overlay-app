@@ -85,7 +85,24 @@ What it does **not** hide from:
 
 **Transcription is independent of who answers.** A Claude-only or NavyAI-only setup (no Gemini key) still transcribes: Ghost simply uses the local engine. Claude has no audio input, so it never transcribes itself — it just receives the transcript like any other provider.
 
-**Capture quality.** Audio is captured at the device's **native rate** (usually 48 kHz) and downsampled to 16 kHz with a 2-pole anti-aliasing low-pass and phase-carried decimation — verified transparent (a clip round-tripped through it transcribes verbatim). Forcing a 16 kHz capture context, which the old build did, made some drivers and Windows loopback hand back mangled or near-silent audio.
+**Capture quality.** Audio is captured on the **audio thread** (an AudioWorklet — a ScriptProcessor runs on the UI thread and silently drops audio whenever the page is busy rendering an answer) at the device's **native rate** (usually 48 kHz), then: a Kaiser-windowed-sinc resampler to 16 kHz (content above the new Nyquist is rejected by > 60 dB; the previous two-pole filter managed a few dB, so sibilants aliased into the speech band), a 70 Hz high-pass (DC / rumble), and a slow click-free gain that is ramped across each frame and mathematically cannot clip (no limiter, no distortion). The same code (`src/renderer/dsp.js`) is what the accuracy benchmark runs, so what is measured is what ships.
+
+**Every stretch of speech reaches the accurate model.** A voice-activity detector (Silero, 0.6 MB, bundled) marks where speech starts and ends on each source. Each segment is cut from a ring of recent audio with padding on both sides (soft onsets, trailing syllables), **levelled with look-ahead** so a quiet talker and a loud one end up equally loud without any pumping, and transcribed by Parakeet — whether or not the fast streaming model heard words in it. Before, a segment only got that far if the streaming model already had text for it (quiet or unclear speech was dropped outright) and it was cut at the streaming model's own pause detector with no padding (clipped first words). The detector listens to a separate fast-levelled copy so faint speech is caught from its first syllable. When steady noise holds the detector open across real pauses, the segment is closed at the *actual* pause (the quietest recent point), not wherever the recognizer happened to notice it. **Pressing Ask never cuts audio**: it sends a snapshot of what is being said so the answer has the latest words, and when the sentence finishes the same line is completed in place.
+
+**Measured** (`node test/stt-bench.js`: word error rate through the real capture DSP → frames → recognizer, on 208 words of real LibriSpeech clips plus a two-voice technical conversation with realistic pauses; `--dsp legacy` on the previous commit gives the *before* column):
+
+| capture condition | before | after |
+|---|---|---|
+| normal level | 2.4 % (2 words missed) | 1.4 % (0 missed) |
+| quiet (system volume at a few %) | 2.9 % (2) | 1.4 % (0) |
+| **faint (volume almost at zero)** | **43.8 % (84)** | **1.4 % (0)** |
+| background noise, 10 dB SNR | 4.8 % (6) | 1.0 % (0) |
+| heavy noise, 3 dB SNR | 13.5 % (15) | 8.7 % (6) |
+| a quiet talker among loud ones (24 dB apart) | 5.8 % (9) | 1.9 % (0) |
+| 44.1 kHz device | 1.9 % (2) | 2.9 % (1) |
+| **all seven** | **10.7 % (120 words missed)** | **2.7 % (7 missed)** |
+
+With Ask pressed every 7 s mid-sentence: 1.4 % / 1.0 % (clean / noisy), nothing missed. What is left is mostly sound-alike vocabulary ("Redis" → "readies", "writes" → "rights"), which the AI transcript cleanup fixes from your context. The material is clean-studio and synthetic speech, so absolute numbers on a real call will be higher; the before/after gap is the point.
 
 **Two-pass local accuracy (default on).** The streaming model gives instant words; the moment a sentence finishes, its audio is re-transcribed by **NVIDIA Parakeet TDT 0.6B** (top of the open ASR leaderboard, with punctuation and casing) in a second worker thread, and the transcript line is replaced in place (~1 s per sentence on CPU, +670 MB one-time download). Provisional words show greyed until the accurate version lands; **Ask** waits up to ~2 s for the correction so answers use the accurate text. Toggle in ⚙ → *Accuracy pass*. This makes local transcription near-Gemini quality — but the input audio still has to be clean: on a real call the "them" side is the pristine digital call stream via loopback and your mic is you speaking directly, both ideal. If accuracy is poor, watch the two level meters while people talk — if a bar barely moves, that side is being captured from the wrong device (common with Voicemeeter installed); pick the right **call audio capture device** in ⚙ or set your real speakers/headphones as the Windows default output.
 
@@ -96,7 +113,8 @@ What it does **not** hide from:
 
 * **Both** (default) = the call (system loopback) **and** your microphone, each on its own Gemini Live session, so transcript lines come back labelled **THEM** / **YOU** and the model knows who asked what. Two level meters in the transcript panel show live input — if a bar doesn't move while someone talks, that side isn't being captured.
 * **Streaming mode (default)** — audio is captured at 16 kHz mono, auto-gained (loopback captures *after* your volume slider), and sent as raw PCM frames every ~256 ms over a WebSocket (`BidiGenerateContent`, model `gemini-3.8-live`, with a fallback list). The server commits `inputTranscription` at each pause — typically well under a second after the phrase. Verified against the real API: every current Live model is AUDIO-output-only and transcription needs the server's VAD on, so sessions run with `responseModalities: ["AUDIO"]` plus a "stay silent" instruction (the model answers with a near-empty "." — negligible cost). Auto-reconnects with session resumption on `goAway` / drops.
-* **Echo ducking** — with speakers (not headphones) your mic hears the other people too. While the call source is active (and for 700 ms after), mic frames are sent as silence so they're never transcribed as YOU. Verified on the real API: level-ratio ducking failed (loopback is ~2 % post-volume vs an auto-gained mic); time-based ducking works.
+* **Echo gate** — with speakers (not headphones) your mic hears the other people too, and that must not be transcribed as YOU. Ghost learns the speaker→mic coupling (mic level ÷ call level while the call is playing, taken from the quietest such frames — the ones where you are not talking) and silences only mic frames that are explained by that bleed. When you talk **over** the other side your voice is clearly above the bleed and is kept; on **headphones** the coupling is ~0, so nothing you say is ever dropped. (The previous rule muted your mic whenever the call made any sound, for 700 ms after — so talking over someone, or background audio on the call, erased your side.) Browser mic AGC is off for this reason: it would amplify the bleed up to speech level whenever you are quiet.
+* **Wrong output device = silence, fixed automatically.** If the default output loopback is pure silence while a mix device (a Voicemeeter bus, Stereo Mix, VB-Cable, BlackHole) is carrying audio, the call is routed there; Ghost switches to it, tells you, and remembers it. Only mix devices are candidates — never a plain microphone. A saved device that has disappeared falls back to the default output instead of going deaf.
 * **Muted speakers = silence.** Windows loopback is captured after the mute/volume stage. If you mute your speakers, Ghost hears nothing from the call and says so in the status line after ~6 s. Use headphones at normal volume, or pick a recording endpoint as the **call audio capture device** in ⚙ (Stereo Mix, a Voicemeeter "Out B" bus, BlackHole on macOS) — those aren't affected by mute. `test/audio-volume.ps1` and `test/default-audio-device.ps1` show what Windows currently has as default / muted.
 * **Windows**: loopback is Electron's WASAPI loopback (`audio: 'loopback'` in `setDisplayMediaRequestHandler`); nothing to install. **macOS**: no loopback in Electron — install [BlackHole](https://github.com/ExistentialAudio/BlackHole), route call audio through it, and pick it as the call audio capture device.
 * **Chunked mode (fallback)** — if the socket can't be established, the app says why in the status line and switches to uploading 5-second WAV chunks (mixed sources) to `generateContent` (`gemini-2.5-flash-lite`, thinking disabled, silence-gated). Free-tier rate limit is ~10–15 req/min; on a 429 it backs off 20 s.
@@ -178,12 +196,18 @@ src/providers/
   gemini.js             REST streaming + chunked audio transcription (fallback)
   gemini-live.js        streaming speech-to-text over the Live API WebSocket
   prompts.js            core prompt + profiles
+  local-stt.js          local engine manager: models, workers, accuracy pass, Ask snapshots
+  local-stt-worker.js   streaming recognizer + Silero VAD: padded, levelled speech segments
+  stt-level.js          loudness: fast gain for the detector, look-ahead levelling per segment
 src/renderer/
   index.html / styles.css
   app.js                chat state, streaming render, listening, settings
-  audio.js              getDisplayMedia/getUserMedia → 16 kHz WAV chunks with silence gate
+  audio.js              capture: loopback + mic on an AudioWorklet, echo gate, frames to the recognizer
+  dsp.js                resampler / high-pass / click-free gain / echo gate (shared with the benchmark)
+  capture-worklet.js    audio-thread block collector (nothing dropped while the UI is busy)
   markdown.js           tiny dependency-free markdown renderer
 test/
+  stt-bench.js          word-error-rate benchmark through the real capture DSP + recognizer (7 conditions)
   affinity-probe.ps1    verifies WDA_EXCLUDEFROMCAPTURE from outside the process
   exp-main.js / exp-probe.ps1   the experiment that found the two Electron gotchas
   smoke-*.js            snippets run by `npm run smoke`

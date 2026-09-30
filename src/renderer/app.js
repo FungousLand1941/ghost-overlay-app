@@ -498,7 +498,45 @@
     elStatus.classList.toggle('err', isErr);
   }
   let silenceWarned = false;
+  // The default-output loopback is silent while a virtual mix device (a Voicemeeter
+  // bus, Stereo Mix, VB-Cable, BlackHole…) is carrying audio: the call is routed
+  // there, not to the default output. Switch to it instead of hearing nothing.
+  // Only mix devices are candidates — never a plain microphone.
+  const MIX_RE = /voicemeeter.*(out|b\d|aux|vaio)|stereo mix|what u hear|cable output|loopback|blackhole|soundflower/i;
+  let rescue = { at: 0, tries: 0, busy: false };
+  async function rescueSilentLoopback() {
+    if (rescue.busy || rescue.tries >= 8 || Date.now() - rescue.at < 6000) return;
+    rescue.busy = true; rescue.at = Date.now(); rescue.tries++;
+    try {
+      const devs = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'audioinput' && d.deviceId && d.deviceId !== 'default' && d.deviceId !== 'communications' && MIX_RE.test(d.label || ''));
+      if (!devs.length) { rescue.tries = 99; return; }
+      const ctx = new AudioContext(); const probes = [];
+      for (const d of devs) {
+        try {
+          const s = await navigator.mediaDevices.getUserMedia({ audio: { deviceId: { exact: d.deviceId }, echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+          const an = ctx.createAnalyser(); an.fftSize = 2048; ctx.createMediaStreamSource(s).connect(an);
+          probes.push({ d, s, an, max: 0 });
+        } catch {}
+      }
+      const buf = new Float32Array(2048);
+      for (let i = 0; i < 12; i++) {
+        await new Promise((r) => setTimeout(r, 100));
+        for (const p of probes) { p.an.getFloatTimeDomainData(buf); let q = 0; for (let k = 0; k < buf.length; k++) q += buf[k] * buf[k]; p.max = Math.max(p.max, Math.sqrt(q / buf.length)); }
+      }
+      probes.forEach((p) => p.s.getTracks().forEach((t) => t.stop())); try { ctx.close(); } catch {}
+      const best = probes.sort((a, b) => b.max - a.max)[0];
+      if (best && best.max > 0.003 && listener && listener.sysLiveFrames === 0) {
+        const mode = listenMode;
+        cfg = await window.ghost.setConfig({ transcription: { callDevice: best.d.deviceId } });
+        listener.stop(); listener = null;
+        await startCapture(mode);
+        setStatus(`call audio found on "${best.d.label}" (the default output is silent) — switched to it`);
+        toast(`Call audio: switched to "${best.d.label}" because the default output was silent. Change it in ⚙ → call audio device.`);
+      }
+    } catch (e) { setStatus(`could not switch call audio device: ${e.message}`, true); } finally { rescue.busy = false; }
+  }
   function renderMeters() {
+    if (listener && 'system' in listener.analysers && listener.sysFrames > 36 && listener.sysLiveFrames === 0 && (cfg.transcription.callDevice || 'loopback') === 'loopback') rescueSilentLoopback();
     // Loopback is captured after Windows' volume/mute stage: muted speakers =
     // pure digital silence. Say so instead of silently hearing nothing.
     if (listener && !silenceWarned && 'system' in listener.analysers && listener.sysFrames > 24 && listener.sysLiveFrames === 0) {
@@ -611,6 +649,7 @@
     el.transcript.classList.remove('hidden');
     liveErrors.clear();
     silenceWarned = false;
+    rescue = { at: 0, tries: 0, busy: false };
 
     let mode = cfg.transcription.mode || 'live';
     let liveInfo = null;

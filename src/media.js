@@ -8,6 +8,7 @@
 const { spawn } = require('child_process');
 const path = require('path');
 const localStt = require('./providers/local-stt');
+const { levelSegment } = require('./providers/stt-level');
 const { UA, decodeEntities } = require('./web');
 
 const MEDIA_EXT = ['mp4', 'm4v', 'mkv', 'webm', 'mov', 'avi', 'wmv', 'flv', 'ts', 'mpg', 'mpeg', '3gp', 'mp3', 'm4a', 'aac', 'wav', 'ogg', 'oga', 'opus', 'flac', 'wma', 'aiff', 'aif'];
@@ -149,7 +150,7 @@ async function transcribeFile(input, { onProgress = () => {}, describeFrames = n
         pending++;
         chain = chain.then(async () => {
           const t = startSample / RATE;
-          try { const text = await localStt.transcribeSamples(samples); if (text) lines.push({ t, text }); }
+          try { const text = await localStt.transcribeSamples(levelSegment(samples)); if (text) lines.push({ t, text }); }
           catch (e) { lines.push({ t, text: `[unrecognised audio: ${e.message}]` }); }
           done = (startSample + samples.length) / RATE; pending--;
           onProgress({ text: `transcribing ${fmtTime(done)}${info.seconds ? ` / ${fmtTime(info.seconds)}` : ''}`, pct: info.seconds ? Math.min(99, Math.round((done / info.seconds) * 100)) : 0 });

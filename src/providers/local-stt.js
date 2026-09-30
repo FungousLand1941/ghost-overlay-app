@@ -97,6 +97,8 @@ let readyPromise = null;
 const byId = new Map();   // stream id -> LocalTranscriber
 let nextId = 1;
 
+// Voice-activity model (Silero, 0.6 MB, shipped with the app): finds every stretch of speech.
+function vadPath() { return path.join(__dirname, '..', '..', 'assets', 'silero_vad.onnx').replace(/app\.asar([\\/])/, 'app.asar.unpacked$1'); }
 function workerPath() {
   // packaged: the worker (and the native module it requires) live in app.asar.unpacked
   return path.join(__dirname, 'local-stt-worker.js').replace(/app\.asar([\\/])/, 'app.asar.unpacked$1');
@@ -109,20 +111,33 @@ function startWorker() {
     const t0 = Date.now();
     worker = new Worker(workerPath());
     worker.on('message', (m) => {
-      if (m.type === 'ready') { workerState = 'ready'; resolve({ ms: m.ms }); return; }
+      if (m.type === 'ready') { workerState = 'ready'; resolve({ ms: m.ms, vad: m.vad }); return; }
       if (m.type === 'init-error') { workerState = 'failed'; reject(new Error(m.error)); return; }
       const t = byId.get(m.id); if (!t) return;
       if (m.type === 'interim') { t.lastPartial = m.text; t.emit('interim', m.text); }
       else if (m.type === 'final') {
-        // provisional line now; the accuracy pass revises it (same uid) when done
-        t.emit('final', m.text, { uid: m.uid, provisional: refineEnabled && refineState !== 'failed' });
-        if (refineEnabled && m.audio && m.audio.length >= 16000 * 0.4) refine(t, m.uid, m.audio);
+        // One speech segment (found by the VAD). If the streaming model has words
+        // for it, show them now and let the accuracy pass revise the line (same
+        // uid). If it heard nothing — quiet or unclear speech — the accuracy pass
+        // alone decides, and its text arrives as a late final.
+        const canRefine = refineEnabled && refineState !== 'failed' && m.audio && m.audio.length >= 16000 * 0.25;
+        const shown = t._shown || (t._shown = new Set());
+        if (shown.has(m.uid)) {
+          // this line is already on screen (an Ask snapshot, now completed or re-snapshotted): update it in place
+          if (canRefine) refine(t, m.uid, m.audio, false);
+          else if (m.text) t.emit('revise', { uid: m.uid, text: m.text });
+        } else {
+          if (m.text) { shown.add(m.uid); t.emit('final', m.text, { uid: m.uid, provisional: canRefine }); }
+          if (canRefine) refine(t, m.uid, m.audio, !m.text);
+        }
       }
+      else if (m.type === 'synced') { const r = t._syncs && t._syncs.shift(); if (r) r(); }
+      else if (m.type === 'log') t.emit('log', m.text);
       else if (m.type === 'error') t.emit('error', Object.assign(new Error(`local STT failed: ${m.error}`), { code: 'LOCAL' }));
     });
     worker.on('error', (e) => { workerState = 'failed'; reject(e); for (const t of byId.values()) t.emit('error', Object.assign(new Error(`local STT worker crashed: ${e.message}`), { code: 'LOCAL' })); });
     worker.on('exit', () => { if (workerState !== 'ready') reject(new Error('local STT worker exited during load')); worker = null; workerState = 'idle'; readyPromise = null; });
-    worker.postMessage({ type: 'init', modelDir: modelDir(), files: MODEL.files, modelType: MODEL.modelType || '' });
+    worker.postMessage({ type: 'init', modelDir: modelDir(), files: MODEL.files, modelType: MODEL.modelType || '', vadModel: vadPath() });
     if (refineEnabled) startRefiner().catch(() => {});
     setTimeout(() => { if (workerState === 'loading') reject(new Error(`local STT model load timed out after ${Date.now() - t0} ms`)); }, 90000);
   });
@@ -149,17 +164,23 @@ function startRefiner() {
     refiner.on('message', (m) => {
       if (m.type === 'ready') { refineState = 'ready'; onRefineLog(`accuracy pass ready (${REFINE_MODEL.id}, load ${m.ms} ms)`); resolve(); return; }
       if (m.type === 'init-error') { refineState = 'failed'; onRefineLog(`accuracy pass failed to load: ${m.error}`); reject(new Error(m.error)); return; }
-      const p = pendingRefine.get(m.uid);
+      const p = pendingRefine.get(m.uid); // m.uid is the job key here
       if (!p) { // not a live utterance: a file segment (video/audio context)
         const f = pendingFile.get(m.uid);
         if (f) { pendingFile.delete(m.uid); if (m.type === 'refined') f.resolve((m.text || '').trim()); else f.reject(new Error(m.error || 'recognition failed')); }
         return;
       }
       pendingRefine.delete(m.uid);
-      if (m.type === 'refined') p.t.emit('revise', { uid: m.uid, text: m.text, ms: m.ms, seconds: m.seconds });
-      else p.t.emit('revise', { uid: m.uid, text: '', error: m.error });
+      const shown = p.t._shown || (p.t._shown = new Set());
+      if (p.silent && !shown.has(p.uid)) {
+        // nothing was shown for this segment yet; a lone word from a sub-second blip is more likely noise than speech
+        const words = (m.text || '').trim().split(/\s+/).filter(Boolean).length;
+        if (m.type === 'refined' && words && !(words === 1 && p.seconds < 0.7)) { shown.add(p.uid); p.t.emit('final', m.text, { uid: p.uid, provisional: false, late: true, ms: m.ms }); }
+      }
+      else if (m.type === 'refined') p.t.emit('revise', { uid: p.uid, text: m.text, ms: m.ms, seconds: m.seconds });
+      else p.t.emit('revise', { uid: p.uid, text: '', error: m.error });
     });
-    refiner.on('error', (e) => { refineState = 'failed'; onRefineLog(`accuracy worker crashed: ${e.message}`); for (const [uid, p] of pendingRefine) p.t.emit('revise', { uid, text: '', error: e.message }); pendingRefine.clear(); failFiles(e); reject(e); });
+    refiner.on('error', (e) => { refineState = 'failed'; onRefineLog(`accuracy worker crashed: ${e.message}`); for (const p of pendingRefine.values()) p.t.emit('revise', { uid: p.uid, text: '', error: e.message }); pendingRefine.clear(); failFiles(e); reject(e); });
     refiner.on('exit', () => { refiner = null; if (refineState !== 'failed') refineState = 'idle'; refinePromise = null; failFiles(new Error('speech recogniser exited')); });
     refiner.postMessage({ type: 'init', modelDir: modelDir(REFINE_MODEL), files: REFINE_MODEL.files, modelType: REFINE_MODEL.modelType });
     setTimeout(() => { if (refineState === 'loading') { refineState = 'failed'; reject(new Error(`accuracy model load timed out after ${Date.now() - t0} ms`)); } }, 120000);
@@ -178,11 +199,13 @@ async function transcribeSamples(samples) {
     refiner.postMessage({ type: 'refine', uid, samples, sampleRate: 16000 }, [samples.buffer]);
   });
 }
-function refine(t, uid, audio) {
+let refineSeq = 0;
+function refine(t, uid, audio, silent = false) {
   if (refineState === 'failed') return;
-  pendingRefine.set(uid, { t, at: Date.now(), seconds: audio.length / 16000 });
-  const send = () => { if (refiner && refineState === 'ready') refiner.postMessage({ type: 'refine', uid, samples: audio, sampleRate: 16000 }, [audio.buffer]); else { pendingRefine.delete(uid); t.emit('revise', { uid, text: '', error: 'refiner not ready' }); } };
-  if (refineState === 'ready') send(); else startRefiner().then(send, () => { pendingRefine.delete(uid); t.emit('revise', { uid, text: '', error: 'refiner unavailable' }); });
+  const key = `${uid}#${++refineSeq}`; // per job: the same line can be refined again (Ask snapshot, then the finished sentence)
+  pendingRefine.set(key, { t, uid, at: Date.now(), seconds: audio.length / 16000, silent });
+  const send = () => { if (refiner && refineState === 'ready') refiner.postMessage({ type: 'refine', uid: key, samples: audio, sampleRate: 16000 }, [audio.buffer]); else { pendingRefine.delete(key); t.emit('revise', { uid, text: '', error: 'refiner not ready' }); } };
+  if (refineState === 'ready') send(); else startRefiner().then(send, () => { pendingRefine.delete(key); t.emit('revise', { uid, text: '', error: 'refiner unavailable' }); });
 }
 function refinePending() { return pendingRefine.size; }
 function shutdownRefiner() { try { refiner?.terminate(); } catch {} refiner = null; refineState = 'idle'; refinePromise = null; pendingRefine.clear(); failFiles(new Error('speech recogniser shut down')); }
@@ -205,12 +228,12 @@ class LocalTranscriber extends EventEmitter {
   async connect() {
     const info = await ensureModel((p) => this.emit('status', `downloading speech model ${p.file} ${p.pct}%`));
     const t0 = Date.now();
-    const { ms } = await startWorker();
+    const { ms, vad } = await startWorker();
     if (this.closed) throw new Error('cancelled');
     byId.set(this.id, this);
     worker.postMessage({ type: 'open', id: this.id });
     this.ready = true;
-    this.emit('log', `local STT ready (${MODEL.id}, ${(info.bytes / 1e6).toFixed(0)} MB, model load ${ms} ms, waited ${Date.now() - t0} ms, off main thread)`);
+    this.emit('log', `local STT ready (${MODEL.id}, ${(info.bytes / 1e6).toFixed(0)} MB, model load ${ms} ms, waited ${Date.now() - t0} ms, off main thread, voice detector ${vad ? 'on' : 'OFF — using recognizer pauses'})`);
     this.emit('status', 'local offline transcription ready');
     return 'local:' + MODEL.id;
   }
@@ -227,6 +250,12 @@ class LocalTranscriber extends EventEmitter {
 
   // "Ask" was pressed: commit whatever is being said right now.
   nudge() { if (this.ready && worker) worker.postMessage({ type: 'nudge', id: this.id }); }
+
+  // Resolves once the worker has decoded everything sent so far (tests / benchmark).
+  drain() {
+    if (!this.ready || !worker) return Promise.resolve();
+    return new Promise((resolve) => { (this._syncs = this._syncs || []).push(resolve); worker.postMessage({ type: 'sync', id: this.id }); });
+  }
 
   close() {
     if (this.closed) return;

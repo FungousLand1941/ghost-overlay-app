@@ -7,3 +7,5 @@ ghost-smoke*.jpg
 dump-*.pcm
 dump-*.wav
 *.part
+
+test/.cache/

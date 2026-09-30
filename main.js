@@ -799,6 +799,25 @@ async function runSmoke() {
       console.log('[ghost] SMOKE_OK', JSON.stringify(results, null, 2));
       return;
     }
+    if (process.env.GHOST_SMOKE === 'stt') {
+      // live listening end to end in this build: file -> 16 kHz frames -> streaming worker + VAD + levelled accuracy pass
+      const t = new localStt.LocalTranscriber({ sampleRate: 16000 });
+      const out = { logs: [], finals: [] }; const byUid = new Map();
+      t.on('log', (s) => out.logs.push(s));
+      t.on('final', (text, meta) => { const l = { uid: meta.uid, text }; out.finals.push(l); byUid.set(meta.uid, l); });
+      t.on('revise', (r) => { const l = byUid.get(r.uid); if (l && r.text) l.text = r.text; });
+      await t.connect();
+      const chunks = [];
+      await media.run(['-nostdin', '-loglevel', 'error', '-i', process.env.GHOST_SMOKE_FILE, '-vn', '-ac', '1', '-ar', '16000', '-f', 's16le', '-'], { onStdout: (c) => { chunks.push(c); } });
+      const pcm = Buffer.concat([Buffer.alloc(32000), ...chunks, Buffer.alloc(16000 * 2 * 3)]);
+      for (let i = 0, k = 0; i < pcm.length; i += 2730, k++) { t.sendAudio(pcm.subarray(i, i + 2730).toString('base64')); if (k % 20 === 0) await wait(60); }
+      await t.drain();
+      for (let k = 0; k < 150 && localStt.refinePending() > 0; k++) await wait(200);
+      await wait(800);
+      results.stt = { logs: out.logs, lines: out.finals.map((l) => l.text) };
+      console.log('[ghost] SMOKE_OK', JSON.stringify(results, null, 2));
+      return;
+    }
     if (process.env.GHOST_SMOKE === 'media') {
       // real-app mp4 ingestion: renderer -> IPC -> ffmpeg -> offline recogniser -> docs
       const file = process.env.GHOST_SMOKE_FILE;

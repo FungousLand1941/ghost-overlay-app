@@ -20,7 +20,7 @@
   });
   try {
     const started = await c.start();
-    out.active = started.active;
+    out.active = started.active; out.engine = started.engine; out.rate = c.rate;
     await new Promise((r) => setTimeout(r, 6000));
     out.framesDucked = c.stats.framesDucked;
     out.lastSysActiveAt = c.lastSysActiveAt;
