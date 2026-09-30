@@ -78,9 +78,23 @@ function emitSegment(id, st, startAbs, endAbs, why = 'vad', postPad = POST_PAD) 
   const to = Math.min(endAbs + postPad, st.total, from + MAX_SEG);
   if (to - Math.max(startAbs, st.lastSegEnd) < MIN_SEG) return; // already covered by the previous segment
   // level the segment with look-ahead: a quiet talker and a loud one end up equally loud
-  const audio = levelSegment(ringSlice(st, from, to));
+  const raw = ringSlice(st, from, to);
+  // A segment that is mostly silenced frames is speaker bleed chopped by the mic's echo gate,
+  // not speech: the accuracy pass would turn the fragments into nonsense words. Drop it.
+  // (mic only: call audio is legitimately all-zero between sentences; only the interior of the segment counts)
+  let zeros = 0, inner = 0;
+  if (st.kind === 'mic') for (let i = PRE_PAD; i < raw.length - POST_PAD; i++) { inner++; if (raw[i] === 0) zeros++; }
   st.lastSegEnd = Math.min(endAbs, to);
-  const text = st.last;
+  if (inner > 0 && zeros > inner * 0.4) { rec.reset(st.s); st.last = ''; st.textStart = -1; st.openUid = null; parentPort.postMessage({ type: 'interim', id, text: '' }); if (DEBUG) parentPort.postMessage({ type: 'log', id, text: `segment dropped: ${Math.round((100 * zeros) / raw.length)}% silenced (echo-gate fragments)` }); return; }
+  const audio = levelSegment(raw);
+  let text = st.last;
+  if (!text && why !== 'snapshot') {
+    // The streaming model heard nothing here. Before the accuracy pass guesses at it
+    // (it will find words in anything), get a second opinion: the streaming model on
+    // the levelled audio. Two models hearing nothing = noise, not speech: drop it.
+    text = secondOpinion(audio);
+    if (!text) { rec.reset(st.s); st.textStart = -1; st.openUid = null; if (DEBUG) parentPort.postMessage({ type: 'log', id, text: `segment dropped (${(audio.length / RATE).toFixed(1)} s): no speech heard by either model` }); return; }
+  }
   rec.reset(st.s); st.last = ''; st.textStart = -1;
   if (!audio.length) return;
   // an Ask snapshot already put a line on screen for this speech: finish that line rather than add one
@@ -89,6 +103,15 @@ function emitSegment(id, st, startAbs, endAbs, why = 'vad', postPad = POST_PAD) 
   if (DEBUG) parentPort.postMessage({ type: 'log', id, text: `segment ${uid} ${why}: speech ${(startAbs / RATE).toFixed(2)}–${(endAbs / RATE).toFixed(2)} s, audio ${(from / RATE).toFixed(2)}–${(to / RATE).toFixed(2)} s, rms ${Math.sqrt(audio.reduce((s, v) => s + v * v, 0) / audio.length).toFixed(4)}, streaming text: "${text.slice(0, 60)}"` });
   parentPort.postMessage({ type: 'final', id, uid, text, audio, seconds: audio.length / RATE }, [audio.buffer]);
   parentPort.postMessage({ type: 'interim', id, text: '' });
+}
+function secondOpinion(audio) {
+  try {
+    const s = rec.createStream();
+    s.acceptWaveform({ sampleRate: RATE, samples: audio });
+    s.acceptWaveform({ sampleRate: RATE, samples: new Float32Array(RATE) }); // tail so the last frames decode
+    while (rec.isReady(s)) rec.decode(s);
+    return tidy(rec.getResult(s).text);
+  } catch { return ''; }
 }
 function drainVad(id, st) {
   while (!st.vad.isEmpty()) {
@@ -173,7 +196,7 @@ parentPort.on('message', (m) => {
       parentPort.postMessage({ type: 'ready', ms: Date.now() - t0, vad: !!vadCfg });
     } else if (m.type === 'open') {
       if (!rec) throw new Error('recognizer not initialised');
-      streams.set(m.id, { s: rec.createStream(), last: '', textStart: -1, vad: makeVad(), fast: makeFastGain(), vadBase: 0, total: 0, chunks: [], lastSegEnd: 0, openUid: null, contig: false });
+      streams.set(m.id, { s: rec.createStream(), last: '', textStart: -1, vad: makeVad(), fast: makeFastGain(), vadBase: 0, total: 0, chunks: [], lastSegEnd: 0, openUid: null, contig: false, kind: m.kind || 'call' });
     } else if (m.type === 'audio') {
       const st = streams.get(m.id); if (!st) return;
       const samples = m.samples;

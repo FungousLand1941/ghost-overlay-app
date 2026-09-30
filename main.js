@@ -25,6 +25,7 @@ const providers = require('./src/providers');
 const SMOKE = !!process.env.GHOST_SMOKE;
 // Smoke runs must never touch the real config (they write dummy keys).
 if (SMOKE) app.setPath('userData', path.join(require('os').tmpdir(), 'ghost-smoke-userdata'));
+else if (process.env.GHOST_USERDATA) app.setPath('userData', process.env.GHOST_USERDATA); // test harnesses: isolated config, never the real one
 const DEFAULT_W = 680;
 const DEFAULT_H = 660;
 const MIN_W = 640; // header holds two big buttons + mode toggle + 7 icons + Quit
@@ -317,7 +318,7 @@ async function startSource(source, engine, cfg) {
   const { LiveTranscriber } = require('./src/providers/gemini-live');
   const t = engine === 'gemini'
     ? new LiveTranscriber({ apiKey: cfg.gemini.apiKey, model: cfg.transcription?.liveModel, sampleRate: 16000 })
-    : new localStt.LocalTranscriber({ sampleRate: 16000 });
+    : new localStt.LocalTranscriber({ sampleRate: 16000, kind: source === 'mic' ? 'mic' : 'call' });
   t.engine = engine;
   t.on('interim', (text) => send('live:event', { type: 'interim', text, speaker, source }));
   t.on('final', (text, meta) => { log(`[live:${speaker}:${engine}] final${meta && meta.provisional ? ' (provisional)' : ''} (${text.split(/\s+/).length} words): ${text.slice(0, 90)}`); send('live:event', { type: 'final', text, speaker, source, uid: meta && meta.uid, provisional: !!(meta && meta.provisional) }); });

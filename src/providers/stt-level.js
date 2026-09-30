@@ -10,15 +10,20 @@
 //                     segment is brought to the same loudness without pumping.
 const RATE = 16000;
 
-function makeFastGain({ target = 0.2, maxGain = 40, floor = 0.0008, block = 160, release = 0.035 } = {}) {
-  let env = 0;
+function makeFastGain({ target = 0.2, maxGain = 40, floor = 0.0008, block = 160, release = 0.035, noiseCeil = 0.02 } = {}) {
+  let env = 0, noise = 0;
+  const recent = new Float32Array(300); let ri = 0, filled = 0; // block peaks over the last 3 s
   return (x) => {
     const out = new Float32Array(x.length);
     for (let i = 0; i < x.length; i += block) {
       const e = Math.min(x.length, i + block);
       let p = 0; for (let j = i; j < e; j++) { const a = x[j] < 0 ? -x[j] : x[j]; if (a > p) p = a; }
+      // noise floor = the quietest block of the last 3 s (follows minima; never drifts up with speech)
+      recent[ri] = p; ri = (ri + 1) % recent.length; if (filled < recent.length) filled++;
+      if (ri % 10 === 0) { let m = Infinity; for (let k = 0; k < filled; k++) if (recent[k] < m) m = recent[k]; noise = m; }
       if (p > floor) env = p > env ? p : env + (p - env) * release; // instant attack, ~0.3 s release (10 ms blocks)
-      const g = env > floor ? Math.min(maxGain, Math.max(1, target / env)) : 1;
+      // never lift the room's noise floor into speech range: that would fire the detector on nothing
+      const g = env > floor ? Math.min(maxGain, Math.max(1, target / env), Math.max(1, noiseCeil / Math.max(noise, 1e-4))) : 1;
       for (let j = i; j < e; j++) { const v = x[j] * g; out[j] = v > 1 ? 1 : v < -1 ? -1 : v; }
     }
     return out;

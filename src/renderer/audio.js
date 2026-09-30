@@ -148,7 +148,7 @@
           // loopback is captured post-volume-slider, so "active" is an absolute floor
           // well above its silence level (~1e-5) but below quiet speech (~1e-2)
           if (rms > 0.002) this.lastSysActiveAt = now;
-          this.gate.system(rms, now);
+          this.gate.system(GhostDSP.subRms(f32, this.rate), now);
           this._emitFrame(name, pcm, rms);
           return;
         }
@@ -158,10 +158,10 @@
         // never transcribed as "you"; a frame where you are talking — even over
         // the other side — is kept. On headphones nothing is ever silenced.
         if ('system' in this.analysers) {
-          this.micQueue.push({ pcm, rms, at: now });
+          this.micQueue.push({ pcm, rms, env: GhostDSP.subRms(f32, this.rate), at: now });
           while (this.micQueue.length > 1) {
             const f = this.micQueue.shift();
-            if (this.gate.mic(f.rms, f.at).duck) { this.stats.framesDucked++; this._emitFrame('mic', new Float32Array(f.pcm.length), 0, true); }
+            if (this.gate.mic(f.env, f.at).duck) { this.stats.framesDucked++; this._emitFrame('mic', new Float32Array(f.pcm.length), 0, true); }
             else this._emitFrame('mic', f.pcm, f.rms);
           }
           return;

@@ -175,7 +175,7 @@ function startRefiner() {
       if (p.silent && !shown.has(p.uid)) {
         // nothing was shown for this segment yet; a lone word from a sub-second blip is more likely noise than speech
         const words = (m.text || '').trim().split(/\s+/).filter(Boolean).length;
-        if (m.type === 'refined' && words && !(words === 1 && p.seconds < 0.7)) { shown.add(p.uid); p.t.emit('final', m.text, { uid: p.uid, provisional: false, late: true, ms: m.ms }); }
+        if (m.type === 'refined' && words && !(words === 1 && p.seconds < 1.5) && !(words === 2 && p.seconds < 1.0)) { shown.add(p.uid); p.t.emit('final', m.text, { uid: p.uid, provisional: false, late: true, ms: m.ms }); }
       }
       else if (m.type === 'refined') p.t.emit('revise', { uid: p.uid, text: m.text, ms: m.ms, seconds: m.seconds });
       else p.t.emit('revise', { uid: p.uid, text: '', error: m.error });
@@ -215,9 +215,10 @@ async function warmUp() { if (!modelReady()) return false; try { await startWork
 function shutdown() { try { worker?.terminate(); } catch {} worker = null; workerState = 'idle'; readyPromise = null; shutdownRefiner(); }
 
 class LocalTranscriber extends EventEmitter {
-  constructor({ sampleRate = 16000 } = {}) {
+  constructor({ sampleRate = 16000, kind = 'call' } = {}) {
     super();
     this.sampleRate = sampleRate;
+    this.kind = kind; // 'mic' | 'call' (the mic's echo gate silences frames; the worker treats those differently)
     this.ready = false;
     this.closed = false;
     this.lastPartial = '';
@@ -231,7 +232,7 @@ class LocalTranscriber extends EventEmitter {
     const { ms, vad } = await startWorker();
     if (this.closed) throw new Error('cancelled');
     byId.set(this.id, this);
-    worker.postMessage({ type: 'open', id: this.id });
+    worker.postMessage({ type: 'open', id: this.id, kind: this.kind });
     this.ready = true;
     this.emit('log', `local STT ready (${MODEL.id}, ${(info.bytes / 1e6).toFixed(0)} MB, model load ${ms} ms, waited ${Date.now() - t0} ms, off main thread, voice detector ${vad ? 'on' : 'OFF — using recognizer pauses'})`);
     this.emit('status', 'local offline transcription ready');

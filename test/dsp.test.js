@@ -60,31 +60,52 @@ const frames = (x, f = 1365) => { const out = []; for (let i = 0; i < x.length; 
   check('silence / noise floor does not pump the gain up', agc3.gain === g0, [g0, agc3.gain]);
 }
 
-// 4. echo gate
-const run = (gate, scenario, nFrames = 200) => {
-  let kept = 0, ducked = 0, userKept = 0, userTotal = 0;
-  for (let i = 0; i < nFrames; i++) {
-    const at = i * 85;
-    const s = scenario(i);
-    gate.system(s.sys, at);
-    const r = gate.mic(s.mic, at);
-    if (i >= 40) { if (r.duck) ducked++; else kept++; if (s.user) { userTotal++; if (!r.duck) userKept++; } }
-  }
-  return { kept, ducked, userKept, userTotal };
-};
+// 4. echo gate — 10 ms envelopes, 80 ms frames, speech-like modulation, 120 ms speaker->mic delay
 {
-  // speakers: the mic hears the other side at ~30 % of the loopback level, the user is silent
-  const r = run(dsp.createEchoGate(), (i) => ({ sys: 0.05 + 0.02 * Math.sin(i), mic: (0.05 + 0.02 * Math.sin(i)) * 0.3 * (0.8 + 0.4 * ((i * 7) % 10) / 10) }));
-  check('speakers, user silent: the bleed is ducked', r.ducked / (r.kept + r.ducked) > 0.9, r);
-  // speakers + the user talks over them every third frame, clearly louder than the bleed
-  const r2 = run(dsp.createEchoGate(), (i) => { const sys = 0.05; const user = i % 3 === 0; return { sys, mic: sys * 0.3 + (user ? 0.08 : 0), user }; });
-  check('speakers, user talks over them: the user is kept', r2.userKept / r2.userTotal > 0.95 && r2.ducked > 0, r2);
-  // headphones: no bleed at all, mic is noise floor except when the user speaks
-  const r3 = run(dsp.createEchoGate(), (i) => { const user = i % 2 === 0; return { sys: 0.05, mic: user ? 0.06 : 0.0008, user }; });
-  check('headphones: everything the user says is kept while the other side talks', r3.userKept === r3.userTotal, r3);
-  // other side silent: never ducks
-  const r4 = run(dsp.createEchoGate(), () => ({ sys: 0.0001, mic: 0.05, user: true }));
-  check('other side silent: mic is never ducked', r4.ducked === 0 && r4.userKept === r4.userTotal, r4);
+  const SUB = 8; // sub-blocks per frame
+  const rnd = (() => { let a = 12345; return () => { a = (a * 1664525 + 1013904223) >>> 0; return a / 4294967296; }; })();
+  // a talker: syllable-rate modulation with pauses; returns level at 10 ms step k
+  const talker = (rate, level, seed) => { let pauseUntil = -1; return (k) => { if (k % 150 === seed) pauseUntil = k + 40; if (k < pauseUntil) return 0; return level * (0.25 + Math.abs(Math.sin(2 * Math.PI * rate * k * 0.01))) * (0.85 + 0.3 * rnd()); }; };
+  const run = (scenario, frames = 220) => {
+    const gate = dsp.createEchoGate();
+    const sysHist = []; let kept = 0, ducked = 0, userKept = 0, userTotal = 0, bleedKept = 0, bleedTotal = 0, lastUser = -99;
+    for (let f = 0; f < frames; f++) {
+      const sysEnv = new Float32Array(SUB), micEnv = new Float32Array(SUB);
+      let user = false;
+      for (let i = 0; i < SUB; i++) {
+        const k = f * SUB + i; const s = scenario.sys(k); sysHist[k] = s; sysEnv[i] = s;
+        const u = scenario.user ? scenario.user(k) : 0; if (u > 0.01) user = true;
+        const echo = scenario.coupling * (sysHist[k - 12] || 0); // 120 ms behind
+        micEnv[i] = Math.sqrt(echo * echo + u * u + 0.0005 * 0.0005);
+      }
+      const at = (f + 1) * SUB * 10;
+      gate.system(sysEnv, at);
+      const r = gate.mic(micEnv, at);
+      if (f < 40) continue; // warm-up (the gate stays conservative for its first 3 s)
+      const sysOn = sysEnv.some((v) => v > 0.002);
+      if (r.duck) ducked++; else kept++;
+      if (user) { lastUser = f; userTotal++; if (!r.duck) userKept++; }
+      else if (sysOn && scenario.coupling > 0 && f - lastUser > 6) { bleedTotal++; if (!r.duck) bleedKept++; } // bleed outside the 400 ms hold-open after your words
+    }
+    return { kept, ducked, userKept, userTotal, bleedKept, bleedTotal };
+  };
+  const other = talker(4, 0.05, 20);
+  // speakers, user silent: the mic carries only bleed (30 % of the loopback level)
+  const r1 = run({ sys: other, coupling: 0.3 });
+  check('speakers, user silent: the bleed is silenced', r1.bleedTotal > 100 && r1.bleedKept / r1.bleedTotal < 0.05, r1);
+  // speakers, and the user talks over the other side in bursts, louder than the bleed
+  const you = talker(3.3, 0.1, 77); // a normal voice into the laptop mic: well above the bleed
+  const r2 = run({ sys: other, coupling: 0.3, user: (k) => (Math.floor(k / 120) % 3 === 0 ? you(k) : 0) });
+  check('speakers, user talks over them: the user is kept, the bleed between is still silenced', r2.userKept / r2.userTotal > 0.9 && r2.bleedKept / r2.bleedTotal < 0.15, r2);
+  // headphones: no bleed at all; the mic is noise floor except when the user speaks
+  const r3 = run({ sys: other, coupling: 0, user: (k) => (Math.floor(k / 120) % 2 === 0 ? you(k) : 0) });
+  check('headphones: nothing the user says is ever silenced', r3.userKept === r3.userTotal, r3);
+  // other side silent: never silences
+  const r4 = run({ sys: () => 0.0001, coupling: 0.3, user: you });
+  check('other side silent: mic is never silenced', r4.ducked === 0 && r4.userKept === r4.userTotal, r4);
+  // quiet speakers: bleed at only 5 % of the loopback level is still recognised as bleed
+  const r5 = run({ sys: talker(4, 0.2, 20), coupling: 0.05 });
+  check('faint bleed (5 %) still silenced', r5.bleedKept / r5.bleedTotal < 0.1, r5);
 }
 // 5. loudness tools used by the recognizer worker
 {

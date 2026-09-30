@@ -95,33 +95,89 @@
   }
 
   // Is this mic frame only the speakers bleeding into the microphone?
-  // The speaker->mic coupling (mic level / system level while the system is
-  // playing) is learned from the quietest such frames — the ones where the user
-  // is not talking. A mic frame well above that is the user speaking over the
-  // other side and is kept. On headphones the coupling is ~0, so nothing the
-  // user says is ever dropped. Until enough frames are seen it is conservative.
-  function createEchoGate({ sysActive = 0.002, windowMs = 450, warmup = 25, history = 160, margin = 2.5, percentile = 0.2, micFloor = 0.004 } = {}) {
-    const sys = [];    // recent system frames { at, rms }
-    const ratios = []; // mic/system level ratios observed while the system was playing
-    let coupling = null;
+  // Bleed is a delayed, attenuated copy of the call audio; your voice is not.
+  // Both sources keep a 10 ms level envelope over the last few seconds. For each
+  // mic frame the mic envelope is correlated with the system envelope over a
+  // range of delays (0–350 ms): a strong correlation means bleed is present,
+  // and the fitted gain at the best delay predicts how loud that bleed should
+  // be right now. The frame is silenced only if bleed is present AND the mic
+  // is no louder than the predicted bleed. So: speakers with you silent ->
+  // silenced; you talking over the other side -> kept (well above the
+  // prediction); headphones -> no correlation, nothing is ever silenced.
+  // Until ~1 s of overlap has been seen it stays conservative.
+  function createEchoGate({ subMs = 10, historySec = 4.5, fitSec = 3, maxLagMs = 350, corrMin = 0.5, prominence = 0.25, margin = 2.0, hangoverMs = 400, sysActive = 0.002, micFloor = 0.0015 } = {}) {
+    const N = Math.round((historySec * 1000) / subMs);
+    const sysEnv = new Float32Array(N), micEnv = new Float32Array(N);
+    const W = Math.round((fitSec * 1000) / subMs), L = Math.round(maxLagMs / subMs);
+    let written = 0, last = { corr: 0, gain: 0, lag: 0 }, seen = null, keepUntil = -1, stable = 0, lastLag = -99;
+    const put = (ring, env, at) => { const end = Math.floor(at / subMs); for (let i = 0; i < env.length; i++) { const k = end - env.length + 1 + i; if (k >= 0) ring[((k % N) + N) % N] = env[i]; } };
     return {
-      system(rms, at) { sys.push({ at, rms }); while (sys.length && sys[0].at < at - 2000) sys.shift(); },
-      mic(rms, at) {
-        let ref = 0;
-        for (const f of sys) if (f.at >= at - windowMs && f.at <= at + 60 && f.rms > ref) ref = f.rms;
-        if (ref < sysActive) return { duck: false, ref, coupling };
-        const ratio = rms / ref;
-        ratios.push(ratio); if (ratios.length > history) ratios.shift();
-        if (ratios.length < warmup) return { duck: true, ref, coupling, warming: true };
-        coupling = ratios.slice().sort((a, b) => a - b)[Math.floor(ratios.length * percentile)];
-        return { duck: !(rms > micFloor && ratio > coupling * margin), ref, coupling };
+      // env: per-10 ms rms values of the frame that ends at time `at` (ms)
+      system(env, at) { put(sysEnv, env, at); written += env.length; },
+      mic(env, at) {
+        put(micEnv, env, at);
+        const end = Math.floor(at / subMs);
+        let sysMax = 0, active = 0; for (let k = end - W - L; k <= end; k++) { const v = sysEnv[((k % N) + N) % N]; if (v > sysMax) sysMax = v; if (v > sysActive) active++; }
+        let mic = 0; for (let i = 0; i < env.length; i++) mic += env[i]; mic /= env.length || 1;
+        if (sysMax < sysActive) return { duck: false, corr: 0, predicted: 0 };
+        // no evidence yet: less than ~1 s of call audio in the window to correlate against -> conservative
+        if (written < W || active < 100) return { duck: at <= keepUntil ? false : true, corr: 0, predicted: 0, warming: true };
+        // best-correlated delay on log envelopes (robust to peaks), gain by least squares on linear ones
+        let best = { corr: -1, lag: 0 }; const corrs = [];
+        const lm = new Float32Array(W), ls = new Float32Array(W);
+        for (let i = 0; i < W; i++) lm[i] = Math.log(micEnv[(((end - W + 1 + i) % N) + N) % N] + 1e-4);
+        let mm = 0; for (let i = 0; i < W; i++) mm += lm[i]; mm /= W;
+        for (let lag = 0; lag <= L; lag++) {
+          let ms = 0; for (let i = 0; i < W; i++) { ls[i] = Math.log(sysEnv[(((end - W + 1 + i - lag) % N) + N) % N] + 1e-4); ms += ls[i]; } ms /= W;
+          let sxy = 0, sxx = 0, syy = 0;
+          for (let i = 0; i < W; i++) { const a = lm[i] - mm, b = ls[i] - ms; sxy += a * b; sxx += a * a; syy += b * b; }
+          const corr = sxx > 0 && syy > 0 ? sxy / Math.sqrt(sxx * syy) : 0;
+          corrs.push(corr);
+          if (corr > best.corr) best = { corr, lag };
+        }
+        let num = 0, den = 0;
+        for (let i = 0; i < W; i++) { const m = micEnv[(((end - W + 1 + i) % N) + N) % N], s = sysEnv[(((end - W + 1 + i - best.lag) % N) + N) % N]; num += m * s; den += s * s; }
+        const gain = den > 0 ? num / den : 0;
+        // level of the delayed call audio under this frame, plus half of its last-300 ms peak:
+        // the mic keeps ringing after the call audio stops (room decay), at a falling level
+        const delayedLevel = (lag) => { let cur = 0, m = 0; for (let k = end - env.length + 1 - lag - 30; k <= end - lag; k++) { const v = sysEnv[((k % N) + N) % N]; if (v > m) m = v; if (k > end - env.length - lag && v > cur) cur = v; } return Math.max(cur, 0.5 * m); };
+        const predicted = gain * delayedLevel(best.lag);
+        // real bleed arrives at one fixed delay: a sharp correlation peak that stays put frame to frame;
+        // a chance correlation between two unrelated voices is broad and wanders
+        const sorted = corrs.slice().sort((a, b) => a - b), median = sorted[sorted.length >> 1];
+        const peaked = best.corr - median >= prominence;
+        stable = peaked && Math.abs(best.lag - lastLag) <= 2 ? stable + 1 : 0; lastLag = best.lag;
+        last = { corr: best.corr, gain, lag: best.lag * subMs };
+        // While you talk over the other side the correlation drops (your voice is
+        // not in the call audio), so remember the coupling from the last clean
+        // bleed and keep predicting with it for a few seconds: bleed right after
+        // your words is still recognised as bleed.
+        // remember the coupling from clean bleed (strong, stable correlation); while you talk the fit is
+        // polluted by your own voice, so never let it inflate the remembered gain quickly
+        if (best.corr >= 0.6 && stable >= 3 && gain > 0 && (!seen || gain <= seen.gain * 1.3 || at - seen.at > 60000)) seen = { gain, lag: best.lag, at };
+        // strong correlation = bleed dominates the mic right now: the fresh fit is clean, use it;
+        // otherwise (you are talking, or a pause) predict with the remembered clean coupling
+        let pred = predicted, evidence = best.corr >= 0.6 && stable >= 3;
+        if (!evidence && seen && at - seen.at < 60000) { pred = seen.gain * delayedLevel(seen.lag); evidence = true; } // the physical coupling does not change on this timescale
+        // speech is continuous: once a frame is clearly you, hold the gate open briefly so the
+        // quiet troughs between your syllables are not zeroed (that would chop words)
+        const isUser = mic > micFloor && mic > margin * pred;
+        if (isUser) keepUntil = at + hangoverMs;
+        const duck = evidence && !isUser && at > keepUntil;
+        return { duck, corr: best.corr, predicted: pred, gain, lag: last.lag };
       },
-      get coupling() { return coupling; },
-      get samples() { return ratios.length; },
+      get coupling() { return last.gain; },
+      get corr() { return last.corr; },
     };
   }
 
   function rmsOf(x) { let s = 0; for (let i = 0; i < x.length; i++) s += x[i] * x[i]; return x.length ? Math.sqrt(s / x.length) : 0; }
+  // rms per `subMs` sub-block of a frame at `rate` (the envelopes the echo gate works on)
+  function subRms(x, rate, subMs = 10) {
+    const n = Math.max(1, Math.round((subMs / 1000) * rate)), out = new Float32Array(Math.max(1, Math.floor(x.length / n)));
+    for (let k = 0; k < out.length; k++) { let s = 0; for (let i = k * n; i < (k + 1) * n; i++) s += x[i] * x[i]; out[k] = Math.sqrt(s / n); }
+    return out;
+  }
 
-  return { createResampler, createHighpass, createAgc, createEchoGate, rmsOf };
+  return { createResampler, createHighpass, createAgc, createEchoGate, rmsOf, subRms };
 });

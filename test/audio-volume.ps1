@@ -1,4 +1,6 @@
 # Prints master volume / mute of the default playback device (CoreAudio IAudioEndpointVolume).
+#   -Set <percent> [-Unmute] / -Mute : change it (used by test harnesses, which restore the previous state).
+param([int]$Set = -1, [switch]$Unmute, [switch]$Mute)
 $src = @"
 using System;
 using System.Runtime.InteropServices;
@@ -25,8 +27,17 @@ namespace CV {
       var v = (IAudioEndpointVolume)o; float s; bool m; v.GetMasterVolumeLevelScalar(out s); v.GetMute(out m);
       return "volume=" + Math.Round(s * 100) + "% muted=" + m;
     }
+    public static void Set(float pct, int mute) {
+      var en = (IMMDeviceEnumerator)new MMDeviceEnumerator();
+      IMMDevice dev; en.GetDefaultAudioEndpoint(0, 1, out dev);
+      var iid = typeof(IAudioEndpointVolume).GUID; object o; dev.Activate(ref iid, 23, IntPtr.Zero, out o);
+      var v = (IAudioEndpointVolume)o; var g = Guid.Empty;
+      if (pct >= 0) v.SetMasterVolumeLevelScalar(pct / 100f, ref g);
+      if (mute >= 0) v.SetMute(mute == 1, ref g);
+    }
   }
 }
 "@
 Add-Type -TypeDefinition $src
+if ($Set -ge 0 -or $Unmute -or $Mute) { [CV.Vol]::Set($Set, $(if ($Mute) { 1 } elseif ($Unmute) { 0 } else { -1 })) }
 [CV.Vol]::Get()
