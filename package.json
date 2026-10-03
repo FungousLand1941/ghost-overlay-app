@@ -1,6 +1,6 @@
 {
   "name": "ghost",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "description": "Screen-share-invisible AI overlay. Bring your own Claude or Gemini API key.",
   "main": "main.js",
   "author": "you",

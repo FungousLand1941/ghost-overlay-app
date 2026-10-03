@@ -45,7 +45,10 @@
       // Capture at the device's NATIVE rate (usually 48 kHz) and resample
       // ourselves. Forcing a 16 kHz AudioContext makes some drivers (and
       // loopback) resample badly or hand back near-silence.
-      this.ctx = new AudioContext();
+      // 'playback' = large audio buffers. Ghost never plays sound, so it has no use for the default
+      // low-latency (few ms) buffers — and with those the audio engine misses its deadlines whenever
+      // the CPU is busy, which silently DROPS captured audio (measured: up to 7 % lost on a loaded laptop).
+      this.ctx = new AudioContext({ latencyHint: 'playback' });
       this.rate = this.ctx.sampleRate;
       const sink = this.ctx.createGain(); sink.gain.value = 0; // keeps the graph alive without playback
       sink.connect(this.ctx.destination);
@@ -65,7 +68,7 @@
         let node;
         if (worklet) {
           node = new AudioWorkletNode(this.ctx, 'ghost-capture', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1], channelCount: 1, channelCountMode: 'explicit', channelInterpretation: 'speakers' });
-          node.port.onmessage = (e) => { if (this.running) this._onSamples(name, e.data); };
+          node.port.onmessage = (e) => { if (this.running) this._onSamples(name, e.data.buf, Math.max(0, (this.ctx.currentTime - e.data.t) * 1000)); };
         } else {
           node = this.ctx.createScriptProcessor(BLOCK, 1, 1);
           node.onaudioprocess = (e) => { if (this.running) this._onSamples(name, new Float32Array(e.inputBuffer.getChannelData(0))); };
@@ -80,10 +83,22 @@
         });
       };
 
+      // Test hook: recorded audio instead of the devices (see main.js 'test:audio'); null in normal use.
+      let fake = null;
+      try { fake = window.ghost && window.ghost.testAudio ? await window.ghost.testAudio() : null; } catch { fake = null; }
+      const fakeStream = (bytes) => {
+        const f32 = new Float32Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 4));
+        const buf = this.ctx.createBuffer(1, f32.length, fake.rate); buf.copyToChannel(f32, 0);
+        const src = this.ctx.createBufferSource(); src.buffer = buf; src.loop = true;
+        const dest = this.ctx.createMediaStreamDestination(); src.connect(dest); src.start();
+        (this._fakeSources || (this._fakeSources = [])).push(src);
+        return dest.stream;
+      };
+
       if (wantSystem) {
         try {
-          let s = null;
-          if (this.callDevice && this.callDevice !== 'loopback') {
+          let s = fake && fake.system ? fakeStream(fake.system) : null;
+          if (!s && this.callDevice && this.callDevice !== 'loopback') {
             // A specific capture endpoint for the call audio (Stereo Mix, a
             // Voicemeeter "Out B" bus, BlackHole on macOS…). Raw: no AEC/AGC,
             // this is a line signal, not a microphone.
@@ -113,7 +128,7 @@
           // Browser AGC is off on purpose: it would re-amplify speaker bleed up to
           // speech level whenever you are quiet, which makes bleed and your voice
           // indistinguishable by level. We apply our own click-free gain later.
-          const s = await navigator.mediaDevices.getUserMedia({
+          const s = fake && fake.mic ? fakeStream(fake.mic) : await navigator.mediaDevices.getUserMedia({
             audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false }, video: false,
           });
           attach('mic', s);
@@ -131,7 +146,14 @@
       return { active: Object.keys(this.analysers), errors, engine: this.stats.engine };
     }
 
-    _onSamples(name, f32) {
+    // waitMs: how long the block sat between being captured and this thread processing it (worklet path)
+    _onSamples(name, f32, waitMs = 0) {
+      this.wait = waitMs;
+      const t0 = performance.now();
+      try { this._process(name, f32); } finally { this.stats.dspMs = (this.stats.dspMs || 0) + (performance.now() - t0); this.stats.blocks = (this.stats.blocks || 0) + 1; }
+    }
+
+    _process(name, f32) {
       const rms = GhostDSP.rmsOf(f32);
       this.lastRms[name] = rms;
       this.stats.lastRms = rms;
@@ -174,7 +196,7 @@
       if (!silent) this.chain[name].agc.process(pcm);
       let peak = 0; for (let i = 0; i < pcm.length; i++) { const a = pcm[i] < 0 ? -pcm[i] : pcm[i]; if (a > peak) peak = a; }
       this.stats.framesSent++;
-      this.onFrame(name, b64(pcmToInt16(pcm)), { rms, peak });
+      this.onFrame(name, b64(pcmToInt16(pcm)), { rms, peak, wait: this.wait || 0 });
     }
 
     // Instantaneous RMS per source, 0..1 — for the UI level meters.

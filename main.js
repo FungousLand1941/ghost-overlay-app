@@ -43,6 +43,8 @@ function log(...args) {
 let inflight = null; // AbortController for the active chat stream
 
 app.commandLine.appendSwitch('disable-features', 'HardwareMediaKeyHandling');
+app.commandLine.appendSwitch('disable-renderer-backgrounding'); // the overlay is often unfocused or hidden while it listens: never deprioritise it
+app.commandLine.appendSwitch('disable-background-timer-throttling');
 // Needed for getDisplayMedia() loopback capture on some GPUs.
 app.commandLine.appendSwitch('enable-features', 'WebRTCPipeWireCapturer');
 
@@ -321,8 +323,10 @@ async function startSource(source, engine, cfg) {
     : new localStt.LocalTranscriber({ sampleRate: 16000, kind: source === 'mic' ? 'mic' : 'call' });
   t.engine = engine;
   t.on('interim', (text) => send('live:event', { type: 'interim', text, speaker, source }));
-  t.on('final', (text, meta) => { log(`[live:${speaker}:${engine}] final${meta && meta.provisional ? ' (provisional)' : ''} (${text.split(/\s+/).length} words): ${text.slice(0, 90)}`); send('live:event', { type: 'final', text, speaker, source, uid: meta && meta.uid, provisional: !!(meta && meta.provisional) }); });
-  t.on('revise', (r) => { if (r.text) log(`[live:${speaker}:${engine}] revised ${r.uid} in ${r.ms} ms (${(r.seconds || 0).toFixed(1)} s audio): ${r.text.slice(0, 90)}`); else log(`[live:${speaker}:${engine}] revise ${r.uid} failed: ${r.error}`); send('live:event', { type: 'revise', uid: r.uid, text: r.text, speaker, source }); });
+  // "+N.N s" = how long after those words were spoken this line arrived (local engine): the lag you would feel
+  const lagOf = (uid) => { const end = t._ends && t._ends.get(uid); return end != null && t._t0 ? ` +${Math.max(0, (Date.now() - (t.heardAt ? t.heardAt(end) : t._t0 + end * 1000)) / 1000).toFixed(1)}s` : ''; };
+  t.on('final', (text, meta) => { log(`[live:${speaker}:${engine}] final${meta && meta.provisional ? ' (provisional)' : ''}${lagOf(meta && meta.uid)}${meta && meta.late ? ` [accuracy pass: waited ${meta.waited} ms, ${meta.ms} ms for ${(meta.seconds || 0).toFixed(1)} s, ${meta.how}]` : ''} (${text.split(/\s+/).length} words): ${text.slice(0, 90)}`); send('live:event', { type: 'final', text, speaker, source, uid: meta && meta.uid, provisional: !!(meta && meta.provisional) }); });
+  t.on('revise', (r) => { if (r.text) log(`[live:${speaker}:${engine}] revised ${r.uid}${lagOf(r.uid)} in ${r.ms} ms (${(r.seconds || 0).toFixed(1)} s audio, waited ${r.waited} ms, ${r.how}): ${r.text.slice(0, 90)}`); else log(`[live:${speaker}:${engine}] revise ${r.uid} failed: ${r.error}`); send('live:event', { type: 'revise', uid: r.uid, text: r.text, speaker, source }); });
   t.on('status', (text) => send('live:event', { type: 'status', text: `${speaker}: ${text}`, speaker, source }));
   t.on('log', (line) => log(`[live:${speaker}:${engine}]`, line));
   t.on('error', async (err) => {
@@ -363,6 +367,9 @@ ipcMain.handle('live:start', async (_e, { sources } = {}) => {
   if (engine !== 'gemini' && !localStt.modelReady()) send('live:event', { type: 'status', text: 'first run: downloading the free speech model (~72 MB, once)…' });
   for (const k of Object.keys(earlyAudio)) delete earlyAudio[k];
   liveStarting = true;
+  for (const k of Object.keys(hop)) delete hop[k]; hopAt = 0;
+  boostCapture();
+  if (process.env.GHOST_PROFILE) profilePage(+process.env.GHOST_PROFILE || 60);
   const results = await Promise.all(wanted.map(async (source) => {
     const speaker = SPEAKER[source];
     try {
@@ -386,7 +393,40 @@ ipcMain.handle('live:start', async (_e, { sources } = {}) => {
 // <userData>/dump-<source>.pcm (raw 16 kHz mono LE), so we can transcribe exactly
 // what Ghost captured and prove whether the fault is capture or recognition.
 const audioDump = process.env.GHOST_DUMP_AUDIO ? {} : null;
-ipcMain.on('live:audio', (_e, { source, data }) => {
+// Capture must win over recognition. On a busy computer the recognizer (and every other app) competes
+// with the audio engine for the CPU; when the audio engine loses, sound is dropped before Ghost ever
+// sees it, and nothing downstream can get it back. The recognizer can shed work and catch up; capture
+// cannot. So the page (which hosts the capture graph) and the audio service run above everything else.
+let boosted = '';
+function boostCapture() {
+  const os = require('os');
+  const pids = [];
+  try { if (win && !win.isDestroyed()) pids.push(win.webContents.getOSProcessId()); } catch {}
+  try { for (const m of app.getAppMetrics()) if (m.type === 'Utility' && /audio/i.test(`${m.serviceName || ''} ${m.name || ''}`)) pids.push(m.pid); } catch {}
+  const done = [];
+  for (const pid of pids) { try { os.setPriority(pid, os.constants.priority.PRIORITY_HIGH); done.push(pid); } catch {} }
+  if (done.join() !== boosted) { boosted = done.join(); log(`[live] capture priority raised for ${done.length} process(es)`); }
+}
+// Delivery diagnostics: for each hop between the microphone/loopback and the recogniser, the worst
+// delay seen in the last 20 s. If Ghost is ever behind, this line says where.
+const hop = {};
+let hopAt = 0;
+function noteHop(source, wait, sent, bytes) {
+  const h = hop[source] || (hop[source] = { wait: 0, ipc: 0, n: 0, samples: 0, since: Date.now() });
+  h.samples += bytes >> 1;
+  if (wait > h.wait) h.wait = wait;
+  const ipc = sent ? Date.now() - sent : 0; if (ipc > h.ipc) h.ipc = ipc;
+  h.n++;
+  const now = Date.now();
+  if (!hopAt) hopAt = now;
+  if (now - hopAt < 20000) return;
+  hopAt = now;
+  boostCapture(); // the browser engine may reset it; keep it up while listening
+  const parts = Object.entries(hop).map(([s, x]) => { const t = live[s]; const r = `${SPEAKER[s] || s}: capture→page ${Math.round(x.wait)} ms, page→main ${x.ipc} ms${t && t.workerLag != null ? `, recognizer queue ${t.workerLag} ms${t.workerShed ? ' (shedding)' : ''}` : ''}`; const got = x.samples / 16000, wall = (now - x.since) / 1000; x.wait = 0; x.ipc = 0; x.n = 0; x.samples = 0; x.since = now; return `${r}, audio ${got.toFixed(1)} s in ${wall.toFixed(1)} s (${((100 * got) / wall).toFixed(0)} %)`; });
+  log(`[live] worst delays, last 20 s — ${parts.join(' | ')} | accuracy queue ${localStt.refinePending()}`);
+}
+ipcMain.on('live:audio', (_e, { source, data, wait, sent }) => {
+  noteHop(source, wait || 0, sent, Math.floor((data.length * 3) / 4));
   if (audioDump) { try { require('fs').appendFileSync(path.join(app.getPath('userData'), `dump-${source}.pcm`), Buffer.from(data, 'base64')); } catch {} }
   const t = live[source];
   if (t) t.sendAudio(data);
@@ -730,6 +770,7 @@ app.whenReady().then(() => setTimeout(async () => { const ok = await localStt.wa
 // provider (Haiku on Claude, flash-lite on Gemini, etc.). Governed like other
 // background work. Only used when transcription is local (Gemini Live is already accurate).
 ipcMain.handle('context:cleanup', async (_e, { lines, background }) => {
+  if (!providers.hasKey(store.get(), providers.effectiveProvider(store.get()))) return { skipped: 'no API key' }; // nothing to ask: do not send keyless requests
   const blocked = gate('cleanup');
   if (blocked) return { skipped: blocked };
   try { const map = await providers.cleanupTranscript(store.get(), { lines, background }); log(`[cleanup] ${Object.keys(map).length} lines polished`); return { map }; }
@@ -737,6 +778,7 @@ ipcMain.handle('context:cleanup', async (_e, { lines, background }) => {
 });
 
 ipcMain.handle('context:summarize', async (_e, { previous, newText }) => {
+  if (!store.get().gemini?.apiKey && !store.get().claude?.apiKey) return { skipped: 'no API key' };
   const blocked = gate('memory');
   if (blocked) return { skipped: blocked };
   try { return { text: await providers.summarize(store.get(), { previous, newText }) }; }
@@ -762,6 +804,35 @@ ipcMain.handle('audio:transcribe', async (_e, { wavBase64, context }) => {
 ipcMain.handle('win:hide', () => win && win.hide());
 ipcMain.handle('win:quit', () => app.quit());
 ipcMain.handle('win:clickthrough', (_e, on) => setClickThrough(on));
+// Test hook (GHOST_FAKE_AUDIO="call.f32;mic.f32", raw 16 kHz mono float32): the renderer plays these
+// into its capture graph instead of opening the loopback / microphone, so the whole app — worklet,
+// DSP, echo gate, IPC, recognizer, transcript UI — can be driven for minutes without a sound.
+// Diagnostic: GHOST_PROFILE=<seconds> records a CPU profile of the page thread from the moment
+// listening starts and writes it to <userData>/page.cpuprofile (open in Chrome DevTools, or see test/profile-top.js).
+async function profilePage(seconds) {
+  try {
+    const dbg = win.webContents.debugger;
+    dbg.attach('1.3');
+    await dbg.sendCommand('Profiler.enable');
+    await dbg.sendCommand('Profiler.setSamplingInterval', { interval: 500 });
+    await dbg.sendCommand('Profiler.start');
+    setTimeout(async () => {
+      try {
+        const { profile } = await dbg.sendCommand('Profiler.stop');
+        require('fs').writeFileSync(path.join(app.getPath('userData'), 'page.cpuprofile'), JSON.stringify(profile));
+        log(`[page] cpu profile written (${seconds} s)`);
+        dbg.detach();
+      } catch (e) { log('[page] profile failed', e.message); }
+    }, seconds * 1000);
+  } catch (e) { log('[page] profiler unavailable', e.message); }
+}
+ipcMain.on('perf:renderer', (_e, o) => { log(`[page] last 20 s: audio processing ${o.dsp} ms over ${o.blocks} blocks, transcript redraw ${o.render} ms over ${o.renders}x, long tasks ${o.longTotal} ms (${o.longN}x, worst ${o.longMax} ms), ${o.lines} lines, ${o.dom} DOM nodes, heap ${o.heap} MB`); });
+ipcMain.handle('test:audio', () => {
+  if (!process.env.GHOST_FAKE_AUDIO) return null;
+  const [sys, mic] = process.env.GHOST_FAKE_AUDIO.split(';');
+  const rd = (p) => { try { return p ? require('fs').readFileSync(p) : null; } catch { return null; } };
+  return { rate: 16000, system: rd(sys), mic: rd(mic) };
+});
 ipcMain.handle('app:info', () => ({ version: app.getVersion(), electron: process.versions.electron }));
 ipcMain.handle('win:state', () => ({
   clickThrough,

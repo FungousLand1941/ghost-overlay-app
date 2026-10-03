@@ -312,6 +312,8 @@ function onAudio(m) {
   // How far behind real time are we? (m.t = when the main process sent this frame)
   const lag = m.t ? Date.now() - m.t : 0;
   if (lag > SHED_OFF) st.lastLagAt = Date.now();
+  if (lag > st.statLag) st.statLag = lag;
+  if (++st.statN >= 120) { parentPort.postMessage({ type: 'stat', id: m.id, lag: st.statLag, shed: st.shed }); st.statN = 0; st.statLag = 0; } // every ~10 s
   if (!st.shed && lag > SHED_ON) {
     st.shed = true; st.dirty = true;
     if (Date.now() - lastShedNote > 15000) { lastShedNote = Date.now(); log(m.id, `recognizer ${(lag / 1000).toFixed(1)} s behind: pausing live partial words to catch up (finished lines keep coming from the accuracy pass)`); }
@@ -388,7 +390,7 @@ parentPort.on('message', (m) => {
         s: rec.createStream(), last: '', textStart: -1, fed: -1, needReset: false, tokBase: 0, recBase: 0, recContig: true,
         vad: makeVad(), fast: makeFastGain(), vadBase: 0, wasDet: false, speechStart: 0, speechUntil: 0, snapAt: 0, nextCutCheck: 0,
         total: 0, chunks: [], lastSegEnd: 0, openUid: null, contig: false, kind: m.kind || 'call',
-        shed: false, dirty: false, lastLagAt: 0,
+        shed: false, dirty: false, lastLagAt: 0, statLag: 0, statN: 0,
       });
     } else if (m.type === 'nudge') {
       const st = streams.get(m.id); if (st) snapshot(m.id, st);

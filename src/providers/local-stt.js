@@ -135,6 +135,7 @@ function startWorker() {
       }
       else if (m.type === 'synced') { const r = t._syncs && t._syncs.shift(); if (r) r(); }
       else if (m.type === 'log') t.emit('log', m.text);
+      else if (m.type === 'stat') { t.workerLag = m.lag; t.workerShed = m.shed; }
       else if (m.type === 'error') t.emit('error', Object.assign(new Error(`local STT failed: ${m.error}`), { code: 'LOCAL' }));
     });
     worker.on('error', (e) => { workerState = 'failed'; reject(e); for (const t of byId.values()) t.emit('error', Object.assign(new Error(`local STT worker crashed: ${e.message}`), { code: 'LOCAL' })); });
@@ -179,9 +180,9 @@ function startRefiner() {
       if (p.silent && !shown.has(p.uid)) {
         // nothing was shown for this segment yet; a lone word from a sub-second blip is more likely noise than speech
         const words = (m.text || '').trim().split(/\s+/).filter(Boolean).length;
-        if (m.type === 'refined' && words && !(words === 1 && p.seconds < 1.5) && !(words === 2 && p.seconds < 1.0)) { shown.add(p.uid); p.t.emit('final', m.text, { uid: p.uid, provisional: false, late: true, ms: m.ms }); }
+        if (m.type === 'refined' && words && !(words === 1 && p.seconds < 1.5) && !(words === 2 && p.seconds < 1.0)) { shown.add(p.uid); p.t.emit('final', m.text, { uid: p.uid, provisional: false, late: true, ms: m.ms, how: m.how, waited: Date.now() - p.at - m.ms, seconds: m.seconds }); }
       }
-      else if (m.type === 'refined') p.t.emit('revise', { uid: p.uid, text: m.text, ms: m.ms, seconds: m.seconds });
+      else if (m.type === 'refined') p.t.emit('revise', { uid: p.uid, text: m.text, ms: m.ms, seconds: m.seconds, how: m.how, waited: Date.now() - p.at - m.ms });
       else p.t.emit('revise', { uid: p.uid, text: '', error: m.error });
     });
     refiner.on('error', (e) => { refineState = 'failed'; onRefineLog(`accuracy worker crashed: ${e.message}`); for (const p of pendingRefine.values()) p.t.emit('revise', { uid: p.uid, text: '', error: e.message }); pendingRefine.clear(); failFiles(e); reject(e); });
@@ -293,8 +294,21 @@ class LocalTranscriber extends EventEmitter {
     return 'local:' + MODEL.id;
   }
 
+  // wall-clock time at which audio position `sec` reached Ghost
+  heardAt(sec) {
+    const marks = this._marks || [];
+    for (let i = marks.length - 1; i >= 0; i--) if (marks[i][0] <= sec) return marks[i][1] + (sec - marks[i][0]) * 1000;
+    return (this._t0 || Date.now()) + sec * 1000;
+  }
+
   sendAudio(base64Pcm16) {
     if (this.closed) return;
+    if (!this._t0) this._t0 = Date.now(); // wall-clock time of audio position 0 (for lag measurement)
+    // when did each second of audio actually arrive? (a mark per second, last 10 min). Counting samples alone
+    // would report audio the computer dropped before Ghost got it as Ghost being behind.
+    const marks = this._marks || (this._marks = []); this._pos = this._pos || 0;
+    if (!marks.length || this._pos - marks[marks.length - 1][0] >= 1) { marks.push([this._pos, Date.now()]); if (marks.length > 600) marks.shift(); }
+    this._pos += (base64Pcm16.length * 3 / 8) / this.sampleRate;
     if (!this.ready || !worker) {
       // The models are still loading (a cold start takes a few seconds). Keep what is being said
       // meanwhile — up to ~20 s — and feed it in the moment the recognizer is up, instead of losing it.

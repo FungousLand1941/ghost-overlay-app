@@ -409,19 +409,55 @@
   let interimText = '';      // words currently being spoken (streaming mode)
   let interimSpeaker = '';
   let interimAt = 0;
+  let interimPaintAt = 0, interimTimer = null;
 
+  // page-thread profile while listening (reported to the log every 20 s): what is this thread spending time on?
+  const perf = { render: 0, renders: 0, longTotal: 0, longMax: 0, longN: 0 };
+  try { new PerformanceObserver((list) => { for (const e of list.getEntries()) { perf.longTotal += e.duration; perf.longN++; if (e.duration > perf.longMax) perf.longMax = e.duration; } }).observe({ entryTypes: ['longtask'] }); } catch {}
+  setInterval(() => {
+    if (!listener) return;
+    window.ghost.perf({ dsp: Math.round(listener.stats.dspMs || 0), blocks: listener.stats.blocks || 0, render: Math.round(perf.render), renders: perf.renders, longTotal: Math.round(perf.longTotal), longMax: Math.round(perf.longMax), longN: perf.longN, lines: transcript.length, dom: document.getElementsByTagName('*').length, heap: performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1048576) : 0 });
+    listener.stats.dspMs = 0; listener.stats.blocks = 0; perf.render = 0; perf.renders = 0; perf.longTotal = 0; perf.longMax = 0; perf.longN = 0;
+  }, 20000);
   function renderTranscript() {
+    const tR = performance.now();
+    try { renderTranscriptNow(); } finally { perf.render += performance.now() - tR; perf.renders++; }
+  }
+  const MAX_LINES_SHOWN = 400;
+  const lineNodes = new WeakMap(); // transcript entry -> its text <span>
+  function makeLine(t) {
+    const wrap = document.createElement('div'); wrap.className = 'ln'; // a block per line: a new line never re-lays-out the earlier ones
+    if (t.speaker) { const s = document.createElement('span'); s.className = `spk ${t.speaker}`; s.textContent = t.speaker === 'you' ? 'You: ' : 'Them: '; wrap.appendChild(s); }
+    const tn = document.createElement('span'); tn.textContent = t.text + '\n'; if (t.provisional) tn.className = 'prov';
+    wrap.appendChild(tn);
+    lineNodes.set(t, tn);
+    return wrap;
+  }
+  // full rebuild: session restore, clear, anything that changes many lines at once
+  function renderTranscriptNow() {
     const box = el.transcriptText;
+    const frag = document.createDocumentFragment();
+    for (const t of transcript.slice(-MAX_LINES_SHOWN)) frag.appendChild(makeLine(t));
     box.textContent = '';
-    for (const t of transcript.slice(-400)) {
-      if (t.speaker) {
-        const s = document.createElement('span'); s.className = `spk ${t.speaker}`; s.textContent = t.speaker === 'you' ? 'You: ' : 'Them: ';
-        box.appendChild(s);
-      }
-      const tn = document.createElement('span'); tn.textContent = t.text + '\n'; if (t.provisional) tn.className = 'prov';
-      box.appendChild(tn);
-    }
+    box.appendChild(frag);
     box.scrollTop = box.scrollHeight;
+  }
+  // one new line: append it (constant cost, however long the call has been)
+  function appendLine(t) {
+    const tR = performance.now();
+    const box = el.transcriptText;
+    box.appendChild(makeLine(t));
+    while (box.childElementCount > MAX_LINES_SHOWN) box.firstElementChild.remove();
+    box.scrollTop = box.scrollHeight;
+    perf.render += performance.now() - tR; perf.renders++;
+  }
+  // one line changed (accuracy pass, clean-up): rewrite just that line
+  function updateLine(t) {
+    const tn = lineNodes.get(t);
+    if (!tn || !tn.isConnected) return; // scrolled out of the shown window
+    const tR = performance.now();
+    tn.textContent = t.text + '\n'; tn.className = t.provisional ? 'prov' : '';
+    perf.render += performance.now() - tR; perf.renders++;
   }
   // Does this utterance look like a question/request aimed at the user?
   const QUESTION_RE = /\?\s*$|^(?:so|okay|ok|and|but|alright|now|hey|um|uh)?[,\s]*(?:what|why|how|when|where|which|who|can you|could you|would you|will you|do you|did you|have you|are you|is there|tell me|walk me|talk me|explain|describe|give me|show me|let's talk about|let's discuss|any idea|thoughts on)\b/i;
@@ -444,7 +480,7 @@
     const entry = { t: Date.now(), text, ...(speaker ? { speaker } : {}), ...(meta.uid ? { uid: meta.uid } : {}), ...(meta.provisional ? { provisional: true } : {}) };
     transcript.push(entry);
     if (!meta.uid) entry.id = `c${Date.now()}${Math.random().toString(36).slice(2, 5)}`; // stable id for cleanup mapping (chunk mode has no uid)
-    renderTranscript();
+    appendLine(entry);
     persist();
     maybeSummarize();
     if (!meta.provisional) maybeCleanup();
@@ -483,7 +519,7 @@
         const fixed = r.map[String(i + 1)];
         if (typeof fixed === 'string' && fixed.trim() && fixed.trim() !== t.text) { if (!t.raw) t.raw = t.text; t.text = fixed.trim(); changed = true; }
       });
-      if (changed) { renderTranscript(); persist(); }
+      if (changed) { targets.forEach(updateLine); persist(); }
     } catch (e) { /* non-fatal */ }
     finally { cleaning = false; }
   }
@@ -491,13 +527,16 @@
     interimText = text || '';
     interimSpeaker = speaker || '';
     interimAt = Date.now();
-    elInterim.textContent = interimText ? `… ${speaker ? (speaker === 'you' ? 'You: ' : 'Them: ') : ''}${interimText}` : '';
+    const paint = () => { interimPaintAt = Date.now(); interimTimer = null; const v = interimText ? `… ${interimSpeaker ? (interimSpeaker === 'you' ? 'You: ' : 'Them: ') : ''}${interimText}` : ''; if (elInterim.textContent !== v) elInterim.textContent = v; };
+    if (!interimText || Date.now() - interimPaintAt >= 200) { clearTimeout(interimTimer); paint(); }
+    else if (!interimTimer) interimTimer = setTimeout(paint, 200 - (Date.now() - interimPaintAt));
   }
   function setStatus(text, isErr = false) {
     elStatus.textContent = text;
     elStatus.classList.toggle('err', isErr);
   }
   let silenceWarned = false;
+  const meterShown = {};
   // The default-output loopback is silent while a virtual mix device (a Voicemeeter
   // bus, Stereo Mix, VB-Cable, BlackHole…) is carrying audio: the call is routed
   // there, not to the default output. Switch to it instead of hearing nothing.
@@ -543,13 +582,16 @@
       silenceWarned = true;
       setStatus('system audio is pure silence — are your speakers muted / volume 0? Unmute (headphones are fine), or pick a capture device in ⚙', true);
     }
+    if (document.hidden) return; // overlay hidden: nothing to draw
     const lv = listener ? listener.levels() : {};
     for (const name of ['system', 'mic']) {
       const bar = $(`lvl-${name}`);
-      if (!(name in lv)) { bar.className = 'off'; bar.style.width = '0'; continue; }
-      const pct = Math.min(100, Math.round(Math.sqrt(lv[name]) * 160)); // sqrt: make quiet speech visible
-      bar.className = pct > 90 ? 'hot' : '';
-      bar.style.width = pct + '%';
+      const pct = name in lv ? Math.min(100, Math.round(Math.sqrt(lv[name]) * 160)) : -1; // sqrt: make quiet speech visible
+      if (Math.abs(pct - (meterShown[name] ?? -9)) < 3) continue; // no visible change
+      meterShown[name] = pct;
+      if (pct < 0) { bar.className = 'off'; bar.style.transform = 'scaleX(0)'; continue; }
+      const cls = pct > 90 ? 'hot' : ''; if (bar.className !== cls) bar.className = cls;
+      bar.style.transform = `scaleX(${pct / 100})`;
     }
   }
 
@@ -565,7 +607,7 @@
     } else if (ev.type === 'revise') {
       // accuracy pass finished for an utterance: replace the provisional line in place
       const e = transcript.find((t) => t.uid === ev.uid);
-      if (e) { if (ev.text) e.text = ev.text; e.provisional = false; renderTranscript(); persist(); }
+      if (e) { if (ev.text) e.text = ev.text; e.provisional = false; updateLine(e); persist(); }
     } else if (ev.type === 'status') { if (/switched to local|using local offline/i.test(ev.text)) listenEngine = 'local'; setStatus(ev.text); }
     else if (ev.type === 'error') {
       liveErrors.add(ev.source);
@@ -623,7 +665,7 @@
       callDevice: cfg.transcription.callDevice || 'loopback',
       chunkSeconds,
       onStatus: (t) => setStatus(t),
-      onFrame: mode === 'live' ? (src, b64) => window.ghost.liveAudio(src, b64) : null,
+      onFrame: mode === 'live' ? (src, b64, info) => window.ghost.liveAudio(src, b64, info && info.wait) : null,
       onChunk: mode === 'chunk' ? (wav, info) => transcribeChunk(wav, info, state) : null,
       onError: (e) => { setStatus(e.message, true); stopListening(); },
     });
@@ -682,7 +724,7 @@
     el.listenTag.classList.remove('hidden');
     $('btn-listen').classList.add('active');
     setDot('listening', 'Listening');
-    meterTimer = setInterval(renderMeters, 100);
+    meterTimer = setInterval(renderMeters, 150);
     const what = started.active.map((n) => (n === 'system' ? 'the call' : 'your mic')).join(' + ');
     const how = mode === 'live'
       ? (String(liveInfo.model).startsWith('local:') ? 'local offline transcription (free, no quota)' : `streaming via ${liveInfo.model}`) + (liveInfo.failed && liveInfo.failed.length ? ` (${liveInfo.failed.join('; ')})` : '')

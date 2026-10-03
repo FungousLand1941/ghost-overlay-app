@@ -18,7 +18,7 @@ class GhostCapture extends AudioWorkletProcessor {
         this.buf.set(ch.subarray(i, i + k), this.n);
         this.n += k; i += k;
         if (this.n === this.buf.length) {
-          this.port.postMessage(this.buf, [this.buf.buffer]);
+          this.port.postMessage({ buf: this.buf, t: currentTime }, [this.buf.buffer]); // t: audio clock when the block was complete
           this.buf = new Float32Array(4096);
           this.n = 0;
         }

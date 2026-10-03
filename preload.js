@@ -17,7 +17,7 @@ contextBridge.exposeInMainWorld('ghost', {
   transcribe: (args) => ipcRenderer.invoke('audio:transcribe', args),
   testKey: (args) => ipcRenderer.invoke('provider:test', args),
   liveStart: (args) => ipcRenderer.invoke('live:start', args),
-  liveAudio: (source, data) => ipcRenderer.send('live:audio', { source, data }),
+  liveAudio: (source, data, wait) => ipcRenderer.send('live:audio', { source, data, wait: wait || 0, sent: Date.now() }),
   summarize: (args) => ipcRenderer.invoke('context:summarize', args),
   cleanupTranscript: (args) => ipcRenderer.invoke('context:cleanup', args),
   sessionSave: (data) => ipcRenderer.invoke('session:save', data),
@@ -52,6 +52,8 @@ contextBridge.exposeInMainWorld('ghost', {
   setClickThrough: (on) => ipcRenderer.invoke('win:clickthrough', on),
   winState: () => ipcRenderer.invoke('win:state'),
   appInfo: () => ipcRenderer.invoke('app:info'),
+  perf: (o) => ipcRenderer.send('perf:renderer', o),
+  testAudio: () => ipcRenderer.invoke('test:audio'), // null unless GHOST_FAKE_AUDIO is set
   openExternal: (url) => ipcRenderer.invoke('shell:open', url),
 
   onChatEvent: on('chat:event'),
