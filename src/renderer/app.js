@@ -652,19 +652,26 @@
     rescue = { at: 0, tries: 0, busy: false };
 
     let mode = cfg.transcription.mode || 'live';
-    let liveInfo = null;
+    let liveInfo = null, started = null, startErr = null;
     if (mode === 'live') {
       setStatus('connecting to Gemini Live…');
       const source = cfg.transcription.sourceOverride || cfg.transcription.source || 'both';
       const sources = source === 'both' ? ['system', 'mic'] : [source];
-      const r = await window.ghost.liveStart({ sources });
+      // Capture starts at once, in parallel with loading the recognizer: the main process holds the
+      // frames until it is ready, so what is said in the first seconds after pressing Listen is kept.
+      const starting = window.ghost.liveStart({ sources });
+      try { started = await startCapture('live'); } catch (e) { startErr = e; }
+      const r = await starting;
       if (r.ok) liveInfo = r;
-      else { mode = 'chunk'; setStatus(`streaming unavailable (${r.error}) — using chunked mode`, true); }
+      else {
+        mode = 'chunk'; setStatus(`streaming unavailable (${r.error}) — using chunked mode`, true);
+        if (listener) { listener.stop(); listener = null; } started = null; startErr = null;
+      }
     }
 
-    let started;
     try {
-      started = await startCapture(mode);
+      if (startErr) throw startErr;
+      if (!started) started = await startCapture(mode);
     } catch (e) {
       if (mode === 'live') await window.ghost.liveStop();
       toast(`Could not start audio: ${e.message}`, true);

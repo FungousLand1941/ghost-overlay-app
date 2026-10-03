@@ -287,13 +287,21 @@ class LocalTranscriber extends EventEmitter {
     byId.set(this.id, this);
     worker.postMessage({ type: 'open', id: this.id, kind: this.kind });
     this.ready = true;
+    if (this._early) { const early = this._early; this._early = null; for (const b of early) this.sendAudio(b); }
     this.emit('log', `local STT ready (${MODEL.id}, ${(info.bytes / 1e6).toFixed(0)} MB, model load ${ms} ms, waited ${Date.now() - t0} ms, off main thread, voice detector ${vad ? 'on' : 'OFF — using recognizer pauses'})`);
     this.emit('status', 'local offline transcription ready');
     return 'local:' + MODEL.id;
   }
 
   sendAudio(base64Pcm16) {
-    if (!this.ready || this.closed || !worker) return;
+    if (this.closed) return;
+    if (!this.ready || !worker) {
+      // The models are still loading (a cold start takes a few seconds). Keep what is being said
+      // meanwhile — up to ~20 s — and feed it in the moment the recognizer is up, instead of losing it.
+      (this._early || (this._early = [])).push(base64Pcm16);
+      if (this._early.length > 240) this._early.shift();
+      return;
+    }
     const buf = Buffer.from(base64Pcm16, 'base64');
     const n = buf.length >> 1;
     const f32 = new Float32Array(n);

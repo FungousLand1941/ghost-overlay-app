@@ -103,6 +103,19 @@ const frames = (x, f = 1365) => { const out = []; for (let i = 0; i < x.length; 
   // other side silent: never silences
   const r4 = run({ sys: () => 0.0001, coupling: 0.3, user: you });
   check('other side silent: mic is never silenced', r4.ducked === 0 && r4.userKept === r4.userTotal, r4);
+  // quiet speakers through a noise-suppressed mic: the bleed is faint and its envelope is mangled, so no
+  // correlation can be established. With the other side talking and no evidence, the mic must not be trusted.
+  {
+    const gate = dsp.createEchoGate(); let kept = 0, total = 0;
+    for (let f = 0; f < 200; f++) {
+      const sysEnv = new Float32Array(SUB), micEnv = new Float32Array(SUB);
+      for (let i = 0; i < SUB; i++) { sysEnv[i] = other(f * SUB + i); micEnv[i] = 0.004 + 0.012 * rnd(); } // unrelated to the call envelope, below speaking level
+      const at = (f + 1) * SUB * 10; gate.system(sysEnv, at);
+      const r = gate.mic(micEnv, at);
+      if (f >= 40 && sysEnv.some((v) => v > 0.002)) { total++; if (!r.duck) kept++; }
+    }
+    check('unsure (faint, uncorrelated bleed): the mic is not trusted while the other side talks', kept / total < 0.05, [kept, total]);
+  }
   // quiet speakers: bleed at only 5 % of the loopback level is still recognised as bleed
   const r5 = run({ sys: talker(4, 0.2, 20), coupling: 0.05 });
   check('faint bleed (5 %) still silenced', r5.bleedKept / r5.bleedTotal < 0.1, r5);

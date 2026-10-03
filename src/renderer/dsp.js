@@ -105,11 +105,11 @@
   // silenced; you talking over the other side -> kept (well above the
   // prediction); headphones -> no correlation, nothing is ever silenced.
   // Until ~1 s of overlap has been seen it stays conservative.
-  function createEchoGate({ subMs = 10, historySec = 4.5, fitSec = 3, maxLagMs = 350, corrMin = 0.5, prominence = 0.25, margin = 2.0, hangoverMs = 400, sysActive = 0.002, micFloor = 0.0015 } = {}) {
+  function createEchoGate({ subMs = 10, historySec = 4.5, fitSec = 3, maxLagMs = 350, corrMin = 0.5, prominence = 0.25, margin = 2.0, hangoverMs = 400, sysActive = 0.002, micFloor = 0.0015, unsureFloor = 0.02 } = {}) {
     const N = Math.round((historySec * 1000) / subMs);
     const sysEnv = new Float32Array(N), micEnv = new Float32Array(N);
     const W = Math.round((fitSec * 1000) / subMs), L = Math.round(maxLagMs / subMs);
-    let written = 0, last = { corr: 0, gain: 0, lag: 0 }, seen = null, keepUntil = -1, stable = 0, lastLag = -99;
+    let written = 0, last = { corr: 0, gain: 0, lag: 0 }, seen = null, keepUntil = -1, stable = 0, lastLag = -99, userLevel = 0;
     const put = (ring, env, at) => { const end = Math.floor(at / subMs); for (let i = 0; i < env.length; i++) { const k = end - env.length + 1 + i; if (k >= 0) ring[((k % N) + N) % N] = env[i]; } };
     return {
       // env: per-10 ms rms values of the frame that ends at time `at` (ms)
@@ -119,7 +119,11 @@
         const end = Math.floor(at / subMs);
         let sysMax = 0, active = 0; for (let k = end - W - L; k <= end; k++) { const v = sysEnv[((k % N) + N) % N]; if (v > sysMax) sysMax = v; if (v > sysActive) active++; }
         let mic = 0; for (let i = 0; i < env.length; i++) mic += env[i]; mic /= env.length || 1;
-        if (sysMax < sysActive) return { duck: false, corr: 0, predicted: 0 };
+        if (sysMax < sysActive) {
+          // the other side is silent: anything speech-like on the mic is you — learn how loud you are
+          if (mic > micFloor * 4) userLevel = userLevel ? userLevel * 0.9 + mic * 0.1 : mic;
+          return { duck: false, corr: 0, predicted: 0 };
+        }
         // no evidence yet: less than ~1 s of call audio in the window to correlate against -> conservative
         if (written < W || active < 100) return { duck: at <= keepUntil ? false : true, corr: 0, predicted: 0, warming: true };
         // best-correlated delay on log envelopes (robust to peaks), gain by least squares on linear ones
@@ -161,9 +165,15 @@
         if (!evidence && seen && at - seen.at < 60000) { pred = seen.gain * delayedLevel(seen.lag); evidence = true; } // the physical coupling does not change on this timescale
         // speech is continuous: once a frame is clearly you, hold the gate open briefly so the
         // quiet troughs between your syllables are not zeroed (that would chop words)
-        const isUser = mic > micFloor && mic > margin * pred;
+        let isUser;
+        if (evidence) isUser = mic > micFloor && mic > margin * pred;
+        // No correlation evidence yet (quiet speakers, or the fit has not settled) while the other side is
+        // talking: do not assume the mic is clean. Keep it only if it is at your own speaking level —
+        // learned from when you spoke alone — or, before that is known, clearly loud. Quiet bleed stays out;
+        // on headphones your voice still passes.
+        else isUser = mic > Math.max(unsureFloor, userLevel * 0.4);
         if (isUser) keepUntil = at + hangoverMs;
-        const duck = evidence && !isUser && at > keepUntil;
+        const duck = !isUser && at > keepUntil;
         return { duck, corr: best.corr, predicted: pred, gain, lag: last.lag };
       },
       get coupling() { return last.gain; },

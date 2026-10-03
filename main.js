@@ -340,6 +340,8 @@ async function startSource(source, engine, cfg) {
   const model = await t.connect();
   if (gen !== liveGen) { t.close(); throw new Error('cancelled'); }
   live[source] = t;
+  const early = earlyAudio[source]; delete earlyAudio[source];
+  if (early && early.length) { log(`[live:${speaker}:${engine}] feeding ${(early.length * 0.085).toFixed(1)} s captured while the recognizer was loading`); for (const d of early) t.sendAudio(d); }
   return model;
 }
 
@@ -359,6 +361,8 @@ ipcMain.handle('live:start', async (_e, { sources } = {}) => {
   const wanted = (sources && sources.length ? sources : ['system']).filter((s) => SPEAKER[s]);
   log('[live] starting sources', wanted, 'engine', engine, engine === 'gemini' ? `model ${cfg.transcription?.liveModel}` : `local model ready=${localStt.modelReady()}`, 'electron', process.versions.electron);
   if (engine !== 'gemini' && !localStt.modelReady()) send('live:event', { type: 'status', text: 'first run: downloading the free speech model (~72 MB, once)…' });
+  for (const k of Object.keys(earlyAudio)) delete earlyAudio[k];
+  liveStarting = true;
   const results = await Promise.all(wanted.map(async (source) => {
     const speaker = SPEAKER[source];
     try {
@@ -373,6 +377,7 @@ ipcMain.handle('live:start', async (_e, { sources } = {}) => {
       return { source, ok: false, error: err.message };
     }
   }));
+  liveStarting = false;
   const ok = results.filter((r) => r.ok);
   if (!ok.length) return { ok: false, error: results.map((r) => `${SPEAKER[r.source]}: ${r.error}`).join(' | ') };
   return { ok: true, model: ok[0].model, sources: ok.map((r) => r.source), failed: results.filter((r) => !r.ok).map((r) => `${SPEAKER[r.source]}: ${r.error}`) };
@@ -383,8 +388,17 @@ ipcMain.handle('live:start', async (_e, { sources } = {}) => {
 const audioDump = process.env.GHOST_DUMP_AUDIO ? {} : null;
 ipcMain.on('live:audio', (_e, { source, data }) => {
   if (audioDump) { try { require('fs').appendFileSync(path.join(app.getPath('userData'), `dump-${source}.pcm`), Buffer.from(data, 'base64')); } catch {} }
-  const t = live[source]; if (t) t.sendAudio(data);
+  const t = live[source];
+  if (t) t.sendAudio(data);
+  else if (liveStarting) {
+    // capture starts at once, the recognizer takes a few seconds to load on a cold start:
+    // keep what is said meanwhile (up to ~20 s per source) and hand it over when it is ready
+    const q = earlyAudio[source] || (earlyAudio[source] = []);
+    q.push(data); if (q.length > 240) q.shift();
+  }
 });
+let liveStarting = false;
+const earlyAudio = {};
 ipcMain.handle('live:nudge', () => { for (const t of Object.values(live)) t.nudge(); });
 ipcMain.handle('live:pendingRevisions', () => localStt.refinePending());
 ipcMain.handle('live:stop', () => stopLive());
