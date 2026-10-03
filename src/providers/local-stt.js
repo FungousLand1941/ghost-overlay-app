@@ -122,13 +122,15 @@ function startWorker() {
         // alone decides, and its text arrives as a late final.
         const canRefine = refineEnabled && refineState !== 'failed' && m.audio && m.audio.length >= 16000 * 0.25;
         const shown = t._shown || (t._shown = new Set());
+        (t._ends || (t._ends = new Map())).set(m.uid, m.end); // audio time each line ends at / starts at (lag measurement)
+        if (!(t._starts || (t._starts = new Map())).has(m.uid)) t._starts.set(m.uid, m.start);
         if (shown.has(m.uid)) {
           // this line is already on screen (an Ask snapshot, now completed or re-snapshotted): update it in place
-          if (canRefine) refine(t, m.uid, m.audio, false);
+          if (canRefine) refine(t, m.uid, m.audio, false, m.text);
           else if (m.text) t.emit('revise', { uid: m.uid, text: m.text });
         } else {
           if (m.text) { shown.add(m.uid); t.emit('final', m.text, { uid: m.uid, provisional: canRefine }); }
-          if (canRefine) refine(t, m.uid, m.audio, !m.text);
+          if (canRefine) refine(t, m.uid, m.audio, !m.text, m.text);
         }
       }
       else if (m.type === 'synced') { const r = t._syncs && t._syncs.shift(); if (r) r(); }
@@ -164,6 +166,7 @@ function startRefiner() {
     refiner.on('message', (m) => {
       if (m.type === 'ready') { refineState = 'ready'; onRefineLog(`accuracy pass ready (${REFINE_MODEL.id}, load ${m.ms} ms)`); resolve(); return; }
       if (m.type === 'init-error') { refineState = 'failed'; onRefineLog(`accuracy pass failed to load: ${m.error}`); reject(new Error(m.error)); return; }
+      if (m.uid === refineBusy) { refineBusy = null; setImmediate(pumpRefine); }
       const p = pendingRefine.get(m.uid); // m.uid is the job key here
       if (!p) { // not a live utterance: a file segment (video/audio context)
         const f = pendingFile.get(m.uid);
@@ -181,7 +184,7 @@ function startRefiner() {
       else p.t.emit('revise', { uid: p.uid, text: '', error: m.error });
     });
     refiner.on('error', (e) => { refineState = 'failed'; onRefineLog(`accuracy worker crashed: ${e.message}`); for (const p of pendingRefine.values()) p.t.emit('revise', { uid: p.uid, text: '', error: e.message }); pendingRefine.clear(); failFiles(e); reject(e); });
-    refiner.on('exit', () => { refiner = null; if (refineState !== 'failed') refineState = 'idle'; refinePromise = null; failFiles(new Error('speech recogniser exited')); });
+    refiner.on('exit', () => { refiner = null; refineBusy = null; if (refineState !== 'failed') refineState = 'idle'; refinePromise = null; failFiles(new Error('speech recogniser exited')); });
     refiner.postMessage({ type: 'init', modelDir: modelDir(REFINE_MODEL), files: REFINE_MODEL.files, modelType: REFINE_MODEL.modelType });
     setTimeout(() => { if (refineState === 'loading') { refineState = 'failed'; reject(new Error(`accuracy model load timed out after ${Date.now() - t0} ms`)); } }, 120000);
   });
@@ -199,16 +202,43 @@ async function transcribeSamples(samples) {
     refiner.postMessage({ type: 'refine', uid, samples, sampleRate: 16000 }, [samples.buffer]);
   });
 }
+// The accuracy pass runs one job at a time from a queue we control, so it can
+// never fall unboundedly behind:
+//   * a newer job for the same line (a later snapshot, or the finished sentence)
+//     replaces a queued older one — only the latest audio is worth transcribing;
+//   * if more than OVERLOAD_SEC of audio is waiting, the oldest lines that already
+//     show the streaming model's text keep that text instead of being re-done.
 let refineSeq = 0;
-function refine(t, uid, audio, silent = false) {
+let refineBusy = null;       // key of the job the worker is on
+const refineQueue = [];      // { key, uid, audio }
+const OVERLOAD_SEC = 40;
+function pumpRefine() {
+  if (refineBusy || !refineQueue.length || !refiner || refineState !== 'ready') return;
+  const job = refineQueue.shift();
+  refineBusy = job.key;
+  refiner.postMessage({ type: 'refine', uid: job.key, samples: job.audio, sampleRate: 16000, hint: job.hint }, [job.audio.buffer]);
+}
+// `hint`: what the streaming model heard in this audio — the accuracy pass must cover those words.
+function refine(t, uid, audio, silent = false, hint = '') {
   if (refineState === 'failed') return;
-  const key = `${uid}#${++refineSeq}`; // per job: the same line can be refined again (Ask snapshot, then the finished sentence)
+  const key = `${uid}#${++refineSeq}`; // per job: the same line can be refined again (snapshot, then the finished sentence)
+  for (let i = refineQueue.length - 1; i >= 0; i--) if (refineQueue[i].uid === uid) { pendingRefine.delete(refineQueue[i].key); refineQueue.splice(i, 1); } // superseded
   pendingRefine.set(key, { t, uid, at: Date.now(), seconds: audio.length / 16000, silent });
-  const send = () => { if (refiner && refineState === 'ready') refiner.postMessage({ type: 'refine', uid: key, samples: audio, sampleRate: 16000 }, [audio.buffer]); else { pendingRefine.delete(key); t.emit('revise', { uid, text: '', error: 'refiner not ready' }); } };
-  if (refineState === 'ready') send(); else startRefiner().then(send, () => { pendingRefine.delete(key); t.emit('revise', { uid, text: '', error: 'refiner unavailable' }); });
+  refineQueue.push({ key, uid, audio, hint });
+  let waiting = 0; for (const j of refineQueue) waiting += j.audio.length / 16000;
+  for (let i = 0; waiting > OVERLOAD_SEC && i < refineQueue.length - 1;) {
+    const j = refineQueue[i], p = pendingRefine.get(j.key);
+    if (p && !p.silent) { // this line already shows text: keep it as it is
+      waiting -= j.audio.length / 16000; refineQueue.splice(i, 1); pendingRefine.delete(j.key);
+      p.t.emit('revise', { uid: j.uid, text: '', skipped: true });
+      onRefineLog(`accuracy pass overloaded: kept the live text for ${j.uid}`);
+    } else i++;
+  }
+  if (refineState === 'ready') pumpRefine();
+  else startRefiner().then(pumpRefine, () => { for (const j of refineQueue.splice(0)) { const p = pendingRefine.get(j.key); pendingRefine.delete(j.key); if (p) p.t.emit('revise', { uid: j.uid, text: '', error: 'refiner unavailable' }); } });
 }
 function refinePending() { return pendingRefine.size; }
-function shutdownRefiner() { try { refiner?.terminate(); } catch {} refiner = null; refineState = 'idle'; refinePromise = null; pendingRefine.clear(); failFiles(new Error('speech recogniser shut down')); }
+function shutdownRefiner() { try { refiner?.terminate(); } catch {} refiner = null; refineState = 'idle'; refinePromise = null; pendingRefine.clear(); refineQueue.length = 0; refineBusy = null; failFiles(new Error('speech recogniser shut down')); }
 
 // Load the models in the background at app start so a mid-call fallback is instant.
 async function warmUp() { if (!modelReady()) return false; try { await startWorker(); return true; } catch { return false; } }
@@ -246,7 +276,7 @@ class LocalTranscriber extends EventEmitter {
     const f32 = new Float32Array(n);
     for (let i = 0; i < n; i++) f32[i] = buf.readInt16LE(i * 2) / 32768;
     this.framesSent++;
-    worker.postMessage({ type: 'audio', id: this.id, sampleRate: this.sampleRate, samples: f32 }, [f32.buffer]);
+    worker.postMessage({ type: 'audio', id: this.id, sampleRate: this.sampleRate, samples: f32, t: Date.now() }, [f32.buffer]);
   }
 
   // "Ask" was pressed: commit whatever is being said right now.
