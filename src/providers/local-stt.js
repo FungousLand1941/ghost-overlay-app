@@ -167,6 +167,7 @@ function startRefiner() {
       if (m.type === 'ready') { refineState = 'ready'; onRefineLog(`accuracy pass ready (${REFINE_MODEL.id}, load ${m.ms} ms)`); resolve(); return; }
       if (m.type === 'init-error') { refineState = 'failed'; onRefineLog(`accuracy pass failed to load: ${m.error}`); reject(new Error(m.error)); return; }
       if (m.uid === refineBusy) { refineBusy = null; setImmediate(pumpRefine); }
+      if (m.type === 'refined' && m.seconds > 1) rtf = rtf ? rtf * 0.8 + (m.ms / 1000 / m.seconds) * 0.2 : m.ms / 1000 / m.seconds;
       const p = pendingRefine.get(m.uid); // m.uid is the job key here
       if (!p) { // not a live utterance: a file segment (video/audio context)
         const f = pendingFile.get(m.uid);
@@ -212,8 +213,29 @@ let refineSeq = 0;
 let refineBusy = null;       // key of the job the worker is on
 const refineQueue = [];      // { key, uid, audio }
 const OVERLOAD_SEC = 40;
+const MAX_WAIT_MS = 20000;   // a segment that has waited this long is given up on (see refine())
+let rtf = 0;                 // measured: seconds of CPU per second of audio in the accuracy pass (moving average)
+function shedStale() {
+  // Still older than MAX_WAIT_MS at the head with nothing left to shortcut: this computer
+  // cannot transcribe as fast as people are talking. For a live assistant, staying current
+  // beats completeness — being minutes behind is useless — so the oldest speech is skipped
+  // (your own side first) and marked in the transcript rather than silently lost.
+  const now = Date.now();
+  while (refineQueue.length > 1 && now - refineQueue[0].at > MAX_WAIT_MS) {
+    let i = refineQueue.findIndex((j) => j.kind === 'mic' && now - j.at > MAX_WAIT_MS); if (i < 0) i = 0;
+    const j = refineQueue.splice(i, 1)[0]; const p = pendingRefine.get(j.key); pendingRefine.delete(j.key);
+    const secs = Math.round(j.audio.length / 16000);
+    if (p) {
+      const shown = p.t._shown || (p.t._shown = new Set());
+      if (shown.has(j.uid)) p.t.emit('revise', { uid: j.uid, text: '', skipped: true });
+      else { shown.add(j.uid); p.t.emit('final', `[${secs} s of speech skipped — this computer could not keep up]`, { uid: j.uid, provisional: false, skipped: true }); }
+    }
+    onRefineLog(`overloaded: skipped ${secs} s of ${j.kind === 'mic' ? 'your' : 'call'} speech that had waited ${Math.round((now - j.at) / 1000)} s${rtf ? ` (accuracy pass runs at ${rtf.toFixed(2)}x real time here)` : ''}`);
+  }
+}
 function pumpRefine() {
   if (refineBusy || !refineQueue.length || !refiner || refineState !== 'ready') return;
+  shedStale();
   const job = refineQueue.shift();
   refineBusy = job.key;
   refiner.postMessage({ type: 'refine', uid: job.key, samples: job.audio, sampleRate: 16000, hint: job.hint }, [job.audio.buffer]);
@@ -224,7 +246,7 @@ function refine(t, uid, audio, silent = false, hint = '') {
   const key = `${uid}#${++refineSeq}`; // per job: the same line can be refined again (snapshot, then the finished sentence)
   for (let i = refineQueue.length - 1; i >= 0; i--) if (refineQueue[i].uid === uid) { pendingRefine.delete(refineQueue[i].key); refineQueue.splice(i, 1); } // superseded
   pendingRefine.set(key, { t, uid, at: Date.now(), seconds: audio.length / 16000, silent });
-  refineQueue.push({ key, uid, audio, hint });
+  refineQueue.push({ key, uid, audio, hint, at: Date.now(), kind: t.kind });
   let waiting = 0; for (const j of refineQueue) waiting += j.audio.length / 16000;
   for (let i = 0; waiting > OVERLOAD_SEC && i < refineQueue.length - 1;) {
     const j = refineQueue[i], p = pendingRefine.get(j.key);
@@ -234,6 +256,7 @@ function refine(t, uid, audio, silent = false, hint = '') {
       onRefineLog(`accuracy pass overloaded: kept the live text for ${j.uid}`);
     } else i++;
   }
+  shedStale();
   if (refineState === 'ready') pumpRefine();
   else startRefiner().then(pumpRefine, () => { for (const j of refineQueue.splice(0)) { const p = pendingRefine.get(j.key); pendingRefine.delete(j.key); if (p) p.t.emit('revise', { uid: j.uid, text: '', error: 'refiner unavailable' }); } });
 }

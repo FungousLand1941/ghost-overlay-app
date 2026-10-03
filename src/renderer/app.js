@@ -1090,6 +1090,8 @@
   refreshHeader();
   renderMode();
   window.ghost.docsList().then(renderDocs); // context badge at launch
+  // which build is this? (the exe is often synced between machines; make it checkable at a glance)
+  window.ghost.appInfo().then((i) => { $('app-version').textContent = `· Ghost v${i.version}`; el.providerTag.title = `Ghost v${i.version}`; }).catch(() => {});
   const ws = await window.ghost.winState();
   document.body.classList.toggle('clickthrough', ws.clickThrough);
   if (!ws.loopbackAudio && (cfg.transcription.source || 'both') !== 'mic' && (cfg.transcription.callDevice || 'loopback') === 'loopback') {

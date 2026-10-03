@@ -13,7 +13,7 @@ const PROVIDER_LABEL = { claude: 'Claude', gemini: 'Gemini', openai: 'OpenAI-com
 
 const MODELS = {
   live: LIVE_MODELS,
-  claude: ['claude-haiku-4-5', 'claude-sonnet-5', 'claude-opus-5'],
+  claude: ['claude-haiku-4-5', 'claude-sonnet-5-5', 'claude-opus-5-5', 'claude-sonnet-5', 'claude-opus-5'],
   // names are auto-resolved against the key's live model list at request time (see gemini.js)
   gemini: ['gemini-3.1-flash-lite', 'gemini-3.1-flash', 'gemini-3-flash-preview', 'gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-2.5-pro', 'gemma-3-27b-it', 'gemma-3-12b-it'],
   transcription: ['gemini-2.5-flash-lite', 'gemini-2.5-flash'],
@@ -48,7 +48,7 @@ async function digest(cfg, text) {
     const c = { ...cfg, maxTokens: 2000, speed: 'fast', gemini: { ...cfg.gemini, model: cfg.gemini.model || 'gemini-2.5-flash' } };
     for await (const t of gemini.stream({ cfg: c, apiKey: cfg.gemini.apiKey, messages, system })) out += t;
   } else if (cfg.claude?.apiKey) {
-    const c = { ...cfg, maxTokens: 2000, speed: 'balanced', claude: { ...cfg.claude, model: cfg.claude.model || 'claude-haiku-4-5' } };
+    const c = { ...cfg, maxTokens: 2000, speed: 'fast', claude: { ...cfg.claude, model: cfg.claude.model || 'claude-haiku-4-5' } };
     for await (const t of claude.stream({ cfg: c, apiKey: cfg.claude.apiKey, messages, system })) out += t;
   } else throw new Error('no API key');
   return out.trim();

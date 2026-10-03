@@ -706,6 +706,7 @@ ipcMain.handle('docs:addUrl', (_e, { url, opts } = {}) => {
 });
 app.on('will-quit', () => media.killAll());
 app.whenReady().then(() => setTimeout(runPendingDigests, 3000));
+app.whenReady().then(() => log(`[ghost] v${app.getVersion()} started (electron ${process.versions.electron}, ${require('os').cpus().length} cpu threads: ${require('os').cpus()[0].model.trim()})`));
 // Warm the local speech engine in its worker thread shortly after launch (if the
 // model is on disk) so a mid-call fallback from Gemini Live is instant.
 app.whenReady().then(() => setTimeout(async () => { const ok = await localStt.warmUp(); log('[stt] local engine warm-up', ok ? 'ready' : 'skipped (model not downloaded yet)'); }, 2500));
@@ -747,6 +748,7 @@ ipcMain.handle('audio:transcribe', async (_e, { wavBase64, context }) => {
 ipcMain.handle('win:hide', () => win && win.hide());
 ipcMain.handle('win:quit', () => app.quit());
 ipcMain.handle('win:clickthrough', (_e, on) => setClickThrough(on));
+ipcMain.handle('app:info', () => ({ version: app.getVersion(), electron: process.versions.electron }));
 ipcMain.handle('win:state', () => ({
   clickThrough,
   opacity: win ? win.getOpacity() : 1,

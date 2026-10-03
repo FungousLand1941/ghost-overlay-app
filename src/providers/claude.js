@@ -1,6 +1,10 @@
 const Anthropic = require('@anthropic-ai/sdk');
 
 const FALLBACK_BETA = 'server-side-fallback-2026-07-01';
+// Server-side refusal fallback exists only for these models. Sending it to any
+// other (Haiku 4.5, Sonnet 5, ...) costs a rejected request and a retry on every answer.
+const FALLBACK_MODELS = /^claude-(fable-5-1|opus-5-5|opus-5|sonnet-5-5)$/;
+let fallbackRejected = false; // the account or a proxy refused the beta once: stop sending it
 
 function toClaudeMessages(messages) {
   const out = [];
@@ -38,18 +42,24 @@ async function* stream({ cfg, apiKey, messages, system, signal }) {
     system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
     messages: toClaudeMessages(messages),
   };
-  // Haiku 4.5 still uses the older thinking API and rejects effort; skip both there.
+  const speed = cfg.speed || 'fast';
   if (!/haiku/i.test(params.model)) {
-    const speed = cfg.speed || 'fast';
     params.thinking = { type: 'adaptive' };
     params.output_config = { effort: speed === 'fast' ? 'low' : speed === 'balanced' ? 'medium' : (c.effort || 'high') };
+  } else if (speed !== 'fast') {
+    // Haiku 4.5 uses the older thinking API (a token budget) and rejects `effort`.
+    // Instant mode: no thinking (fastest first word). Think mode: a real thinking budget,
+    // with room left for the answer (the budget must be below max_tokens).
+    const budget = speed === 'balanced' ? 2000 : 6000;
+    params.thinking = { type: 'enabled', budget_tokens: budget };
+    params.max_tokens = Math.max(params.max_tokens, budget + 2048);
   }
 
   // Server-side refusal fallback: if the primary model declines on policy,
   // the API re-runs the request on a fallback model inside the same call.
   // Configurable (cfg.claude.fallbacks); we retry without it if the account
   // or proxy rejects the beta.
-  const useFallback = c.fallbacks !== false;
+  const useFallback = c.fallbacks !== false && !fallbackRejected && FALLBACK_MODELS.test(params.model);
   const run = (withFallback) => withFallback
     ? client.beta.messages.stream({ ...params, betas: [FALLBACK_BETA], fallbacks: 'default' }, { signal })
     : client.messages.stream(params, { signal });
@@ -60,6 +70,7 @@ async function* stream({ cfg, apiKey, messages, system, signal }) {
     yield* consume(s);
   } catch (err) {
     if (useFallback && err instanceof Anthropic.BadRequestError && /fallback/i.test(String(err.message))) {
+      fallbackRejected = true;
       s = run(false);
       yield* consume(s);
       return;
@@ -71,7 +82,7 @@ async function* stream({ cfg, apiKey, messages, system, signal }) {
       if (id) {
         try { module.exports.onWorkspaceDiscovered?.(id); } catch {}
         const client2 = new Anthropic({ apiKey, maxRetries: 1, defaultHeaders: { 'anthropic-workspace-id': id } });
-        s = useFallback ? client2.beta.messages.stream({ ...params, betas: [FALLBACK_BETA], fallbacks: 'default' }, { signal }) : client2.messages.stream(params, { signal });
+        s = useFallback && !fallbackRejected ? client2.beta.messages.stream({ ...params, betas: [FALLBACK_BETA], fallbacks: 'default' }, { signal }) : client2.messages.stream(params, { signal });
         yield* consume(s);
         return;
       }

@@ -113,6 +113,9 @@ const pct = (arr, p) => { if (!arr.length) return 0; const s = arr.slice().sort(
   console.log(`  FIRST WORDS of a line: spoken -> on screen  median ${r.spokenToScreen.median} s · p95 ${r.spokenToScreen.p95} s · max ${r.spokenToScreen.max} s`);
   console.log(`  line shown after speech ends:   median ${r.shown.median} s · p95 ${r.shown.p95} s · max ${r.shown.max} s  (${r.shown.n} lines)`);
   console.log(`  accuracy pass finished after:   median ${r.refined.median} s · p95 ${r.refined.p95} s · max ${r.refined.max} s`);
+  const skipped = lines.flat().filter((l) => /speech skipped/.test(l.text)).length;
+  r.skippedLines = skipped;
+  console.log(`  lines skipped because the machine could not keep up: ${skipped}`);
   console.log(`  recognizer backlog:             max ${r.workerBacklog.max} s while running · ${r.workerBacklog.atEnd} s left at the end · accuracy queue ${r.refineTailSec} s`);
   const json = opt('json', null); if (json) fs.writeFileSync(json, JSON.stringify(r, null, 2));
   localStt.shutdown(); setTimeout(() => process.exit(0), 300);

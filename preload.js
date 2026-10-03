@@ -51,6 +51,7 @@ contextBridge.exposeInMainWorld('ghost', {
   quit: () => ipcRenderer.invoke('win:quit'),
   setClickThrough: (on) => ipcRenderer.invoke('win:clickthrough', on),
   winState: () => ipcRenderer.invoke('win:state'),
+  appInfo: () => ipcRenderer.invoke('app:info'),
   openExternal: (url) => ipcRenderer.invoke('shell:open', url),
 
   onChatEvent: on('chat:event'),
