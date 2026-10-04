@@ -234,7 +234,20 @@ function shedStale() {
     onRefineLog(`overloaded: skipped ${secs} s of ${j.kind === 'mic' ? 'your' : 'call'} speech that had waited ${Math.round((now - j.at) / 1000)} s${rtf ? ` (accuracy pass runs at ${rtf.toFixed(2)}x real time here)` : ''}`);
   }
 }
+// Finished lines matter more than live partial words. When the accuracy pass starts to queue up
+// (a slow or throttled computer, both sides talking), tell the streaming recognizer to stand down so
+// the accuracy pass gets the CPU; it resumes as soon as the queue is empty again.
+let pressure = false;
+function updatePressure() {
+  const wait = refineQueue.length ? Date.now() - refineQueue[0].at : 0;
+  // on only when the accuracy pass is really behind (its oldest job has waited 3 s); off once it has caught up
+  const on = pressure ? refineQueue.length > 0 : wait > 3000;
+  if (on === pressure) return;
+  pressure = on;
+  try { if (worker) worker.postMessage({ type: 'pressure', on }); } catch {}
+}
 function pumpRefine() {
+  updatePressure();
   if (refineBusy || !refineQueue.length || !refiner || refineState !== 'ready') return;
   shedStale();
   const job = refineQueue.shift();
@@ -258,6 +271,7 @@ function refine(t, uid, audio, silent = false, hint = '') {
     } else i++;
   }
   shedStale();
+  updatePressure();
   if (refineState === 'ready') pumpRefine();
   else startRefiner().then(pumpRefine, () => { for (const j of refineQueue.splice(0)) { const p = pendingRefine.get(j.key); pendingRefine.delete(j.key); if (p) p.t.emit('revise', { uid: j.uid, text: '', error: 'refiner unavailable' }); } });
 }

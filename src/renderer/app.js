@@ -416,7 +416,7 @@
   try { new PerformanceObserver((list) => { for (const e of list.getEntries()) { perf.longTotal += e.duration; perf.longN++; if (e.duration > perf.longMax) perf.longMax = e.duration; } }).observe({ entryTypes: ['longtask'] }); } catch {}
   setInterval(() => {
     if (!listener) return;
-    window.ghost.perf({ dsp: Math.round(listener.stats.dspMs || 0), blocks: listener.stats.blocks || 0, render: Math.round(perf.render), renders: perf.renders, longTotal: Math.round(perf.longTotal), longMax: Math.round(perf.longMax), longN: perf.longN, lines: transcript.length, dom: document.getElementsByTagName('*').length, heap: performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1048576) : 0 });
+    window.ghost.perf({ echoDb: Math.round(listener.stats.echoDb || 0), ducked: listener.stats.framesDucked || 0, dsp: Math.round(listener.stats.dspMs || 0), blocks: listener.stats.blocks || 0, render: Math.round(perf.render), renders: perf.renders, longTotal: Math.round(perf.longTotal), longMax: Math.round(perf.longMax), longN: perf.longN, lines: transcript.length, dom: document.getElementsByTagName('*').length, heap: performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1048576) : 0 });
     listener.stats.dspMs = 0; listener.stats.blocks = 0; perf.render = 0; perf.renders = 0; perf.longTotal = 0; perf.longMax = 0; perf.longN = 0;
   }, 20000);
   function renderTranscript() {
@@ -451,6 +451,14 @@
     box.scrollTop = box.scrollHeight;
     perf.render += performance.now() - tR; perf.renders++;
   }
+  // a line that finished late but was spoken earlier: insert it before the line that follows it
+  function insertLineBefore(t, next) {
+    const nextNode = lineNodes.get(next);
+    const wrap = nextNode && nextNode.isConnected ? nextNode.parentNode : null;
+    if (!wrap) { appendLine(t); return; }
+    el.transcriptText.insertBefore(makeLine(t), wrap);
+    while (el.transcriptText.childElementCount > MAX_LINES_SHOWN) el.transcriptText.firstElementChild.remove();
+  }
   // one line changed (accuracy pass, clean-up): rewrite just that line
   function updateLine(t) {
     const tn = lineNodes.get(t);
@@ -477,10 +485,14 @@
   }
 
   function addTranscript(text, speaker, meta = {}) {
-    const entry = { t: Date.now(), text, ...(speaker ? { speaker } : {}), ...(meta.uid ? { uid: meta.uid } : {}), ...(meta.provisional ? { provisional: true } : {}) };
-    transcript.push(entry);
+    const entry = { t: Date.now(), text, ...(speaker ? { speaker } : {}), ...(meta.uid ? { uid: meta.uid } : {}), ...(meta.provisional ? { provisional: true } : {}), ...(meta.at ? { at: meta.at } : {}) };
     if (!meta.uid) entry.id = `c${Date.now()}${Math.random().toString(36).slice(2, 5)}`; // stable id for cleanup mapping (chunk mode has no uid)
-    appendLine(entry);
+    // Lines can finish out of order (the accuracy pass is a queue shared by both sides): put this one
+    // where it was SPOKEN, so the transcript — and what the AI reads — follows the conversation.
+    let i = transcript.length;
+    if (entry.at) while (i > 0 && transcript[i - 1].at && transcript[i - 1].at > entry.at && transcript.length - i < 12) i--;
+    transcript.splice(i, 0, entry);
+    if (i === transcript.length - 1) appendLine(entry); else insertLineBefore(entry, transcript[i + 1]);
     persist();
     maybeSummarize();
     if (!meta.provisional) maybeCleanup();
@@ -601,7 +613,7 @@
     if (listenMode !== 'live') return;
     if (ev.type === 'interim') setInterim(ev.text, ev.speaker);
     else if (ev.type === 'final') {
-      addTranscript(ev.text, ev.speaker, { uid: ev.uid, provisional: ev.provisional });
+      addTranscript(ev.text, ev.speaker, { uid: ev.uid, provisional: ev.provisional, at: ev.at });
       setInterim('');
       setStatus(`${ev.speaker || 'heard'}: ${ev.text.split(/\s+/).length} words${ev.provisional ? ' (refining…)' : ''} · ${new Date().toLocaleTimeString()}`);
     } else if (ev.type === 'revise') {

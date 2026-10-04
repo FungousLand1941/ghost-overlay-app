@@ -71,7 +71,10 @@ function pieces(samples, depth) {
 function transcribe(samples, hint) {
   const sec = samples.length / RATE;
   const hintWords = norm(hint);
-  const useHint = hintWords.length >= 4;
+  // a hint with more words than this audio could hold (fast speech is ~4 words a second) is not this
+  // audio's text: it would make a correct transcription look incomplete. Do not judge by it.
+  const plausible = hintWords.length <= Math.max(4, (samples.length / 16000) * 5.5);
+  const useHint = hintWords.length >= 4 && plausible;
   if (!useHint) {
     // No reference (the streaming model was shed, or heard nothing).
     // One pass (two halves if the audio is long). Only when that is clearly too

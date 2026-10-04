@@ -57,8 +57,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     t.sendAudio(Buffer.from(i16.buffer).toString('base64'));
     if (i <= askAt && askAt < i + 4096) {
       await t.drain(); await sleep(1500); // let the recognizer catch up to "now", as it is live
-      const before = lines.length; t.nudge(); await t.drain(); await sleep(1500);
-      snapshotSeen = lines.length > before && /complexity|binary/i.test(lines.map((l) => l.text).join(' '));
+      const before = lines.length; t.nudge(); await t.drain();
+      // on a busy machine the line can take a few seconds (the accuracy pass supplies it when the live words were shed)
+      for (let k = 0; k < 40 && !snapshotSeen; k++) { await sleep(250); snapshotSeen = lines.length > before && /complexity|binary/i.test(lines.map((l) => l.text).join(' ')); }
     }
     const due = started + ((i / RATE) * 1000) / 3; if (Date.now() < due) await sleep(due - Date.now());
   }

@@ -324,8 +324,10 @@ async function startSource(source, engine, cfg) {
   t.engine = engine;
   t.on('interim', (text) => send('live:event', { type: 'interim', text, speaker, source }));
   // "+N.N s" = how long after those words were spoken this line arrived (local engine): the lag you would feel
+  // wall-clock time the words of this line began (lines can finish out of order; the transcript is kept in speaking order)
+  const spokenAt = (uid) => { const s = t._starts && t._starts.get(uid); return s != null && t.heardAt ? Math.round(t.heardAt(s)) : undefined; };
   const lagOf = (uid) => { const end = t._ends && t._ends.get(uid); return end != null && t._t0 ? ` +${Math.max(0, (Date.now() - (t.heardAt ? t.heardAt(end) : t._t0 + end * 1000)) / 1000).toFixed(1)}s` : ''; };
-  t.on('final', (text, meta) => { log(`[live:${speaker}:${engine}] final${meta && meta.provisional ? ' (provisional)' : ''}${lagOf(meta && meta.uid)}${meta && meta.late ? ` [accuracy pass: waited ${meta.waited} ms, ${meta.ms} ms for ${(meta.seconds || 0).toFixed(1)} s, ${meta.how}]` : ''} (${text.split(/\s+/).length} words): ${text.slice(0, 90)}`); send('live:event', { type: 'final', text, speaker, source, uid: meta && meta.uid, provisional: !!(meta && meta.provisional) }); });
+  t.on('final', (text, meta) => { log(`[live:${speaker}:${engine}] final${meta && meta.provisional ? ' (provisional)' : ''}${lagOf(meta && meta.uid)}${meta && meta.late ? ` [accuracy pass: waited ${meta.waited} ms, ${meta.ms} ms for ${(meta.seconds || 0).toFixed(1)} s, ${meta.how}]` : ''} (${text.split(/\s+/).length} words): ${text.slice(0, 90)}`); send('live:event', { type: 'final', text, speaker, source, uid: meta && meta.uid, provisional: !!(meta && meta.provisional), at: spokenAt(meta && meta.uid) }); });
   t.on('revise', (r) => { if (r.text) log(`[live:${speaker}:${engine}] revised ${r.uid}${lagOf(r.uid)} in ${r.ms} ms (${(r.seconds || 0).toFixed(1)} s audio, waited ${r.waited} ms, ${r.how}): ${r.text.slice(0, 90)}`); else log(`[live:${speaker}:${engine}] revise ${r.uid} failed: ${r.error}`); send('live:event', { type: 'revise', uid: r.uid, text: r.text, speaker, source }); });
   t.on('status', (text) => send('live:event', { type: 'status', text: `${speaker}: ${text}`, speaker, source }));
   t.on('log', (line) => log(`[live:${speaker}:${engine}]`, line));
@@ -826,7 +828,7 @@ async function profilePage(seconds) {
     }, seconds * 1000);
   } catch (e) { log('[page] profiler unavailable', e.message); }
 }
-ipcMain.on('perf:renderer', (_e, o) => { log(`[page] last 20 s: audio processing ${o.dsp} ms over ${o.blocks} blocks, transcript redraw ${o.render} ms over ${o.renders}x, long tasks ${o.longTotal} ms (${o.longN}x, worst ${o.longMax} ms), ${o.lines} lines, ${o.dom} DOM nodes, heap ${o.heap} MB`); });
+ipcMain.on('perf:renderer', (_e, o) => { log(`[page] last 20 s: audio processing ${o.dsp} ms over ${o.blocks} blocks, transcript redraw ${o.render} ms over ${o.renders}x, long tasks ${o.longTotal} ms (${o.longN}x, worst ${o.longMax} ms), ${o.lines} lines, ${o.dom} DOM nodes, heap ${o.heap} MB, mic: call audio removed ${o.echoDb} dB, ${o.ducked} frames silenced as speaker bleed`); });
 ipcMain.handle('test:audio', () => {
   if (!process.env.GHOST_FAKE_AUDIO) return null;
   const [sys, mic] = process.env.GHOST_FAKE_AUDIO.split(';');

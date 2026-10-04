@@ -52,6 +52,8 @@ const PREROLL = Math.round(0.6 * RATE);   // fed to the recognizer before the po
 const HANG = Math.round(1.2 * RATE);      // keep decoding this long after speech ends (trailing words, pause detection)
 const LONG_SPEECH = RATE * 5;             // unbroken speech longer than this gets cut at its best pause
 const MIN_PIECE = Math.round(2.5 * RATE); // ...leaving at least this much in the piece that is cut off
+const NOISY_CUT = RATE * 8;               // unbroken speech this long with no clean pause: accept a dip to the noise floor as the pause
+const FORCE_CUT = RATE * 12;             // speech with no pause at all is cut at its quietest instant once it is this long
 const SNAP_EVERY = RATE * 9;              // safety net: speech with no usable pause still gets a line this often
 const SHED_ON = 900, SHED_OFF = 250;      // ms behind real time: stop / resume the streaming model
 const SILENT_PEAK = 0.0015;               // below this a frame is plain silence (idle loopback, gated mic)
@@ -184,14 +186,27 @@ function emitSegment(id, st, startAbs, endAbs, why = 'vad', postPad = POST_PAD, 
   st.lastSegEnd = Math.min(endAbs, to);
   st.snapAt = 0;
   const dirty = st.dirty; st.dirty = st.shed; // the streaming model sat out part of this segment
-  const done = () => { if (opts.keep) { st.last = dirty ? '' : pendingText(st); st.textStart = st.last ? st.lastSegEnd : -1; if (!dirty) parentPort.postMessage({ type: 'interim', id, text: st.last }); } else resetText(id, st); };
+  let split = null; // the streaming text of the words before a keep-cut, when it can be split off
+  const done = () => {
+    if (!opts.keep) { resetText(id, st); return; }
+    if (dirty || split === null) {
+      // The words before the cut could not be split off the streaming text (it sat out part of this
+      // speech, or its timing is not contiguous). Left there, they would be glued onto the NEXT line's
+      // text — the accuracy pass would then distrust its own correct result and keep garbled, repeated
+      // words. Restart the streaming model at the cut instead, on the audio after it.
+      rec.reset(st.s); st.tokBase = 0; st.recBase = st.lastSegEnd; st.fed = st.lastSegEnd; st.recContig = true;
+      st.last = ''; st.textStart = -1; parentPort.postMessage({ type: 'interim', id, text: '' });
+      return;
+    }
+    st.last = pendingText(st); st.textStart = st.last ? st.lastSegEnd : -1; parentPort.postMessage({ type: 'interim', id, text: st.last });
+  };
   if (inner > 0 && zeros > inner * 0.4) { done(); st.openUid = null; if (DEBUG) log(id, `segment dropped: ${Math.round((100 * zeros) / inner)}% silenced (echo-gate fragments)`); return; }
   // level the segment with look-ahead: a quiet talker and a loud one end up equally loud
   const audio = levelSegment(raw);
   // The streaming model's text for exactly this audio: shown at once, and the reference
   // the accuracy pass has to cover (it must not drop a voice).
   let text = '';
-  if (!dirty) text = opts.keep ? (takeTextBefore(st, endAbs) ?? '') : finishText(st);
+  if (!dirty) { if (opts.keep) { split = takeTextBefore(st, endAbs); text = split ?? ''; } else text = finishText(st); }
   if (!text && !dirty && !opts.keep && !st.openUid && Date.now() - st.lastLagAt > 3000) {
     // The streaming model listened to all of this and heard nothing. Before the
     // accuracy pass guesses at it (it will find words in anything), get a second
@@ -245,16 +260,26 @@ function cutAtBestPause(id, st) {
   const W = 320, n = Math.floor(x.length / W); if (n < 8) return false;
   const r = new Float32Array(n);
   for (let k = 0; k < n; k++) { let s = 0; for (let j = k * W; j < (k + 1) * W; j++) s += x[j] * x[j]; r[k] = Math.sqrt(s / W); }
-  const loud = Float32Array.from(r).sort()[Math.floor(n * 0.9)];
-  const thr = Math.max(loud * 0.08, 2e-4);
+  const sorted = Float32Array.from(r).sort();
+  const loud = sorted[Math.floor(n * 0.9)], floor = sorted[Math.floor(n * 0.08)];
+  // a pause is quiet relative to the speech — or, when there is steady noise under the speech
+  // (a fan, a street, a bad line), as quiet as this audio ever gets: the noise floor itself
+  // (only once the speech has run long without a cut: used from the start, the noise-floor rule cuts
+  // ordinary noisy conversation at every dip, mid-sentence)
+  const thr = Math.max(loud * 0.08, st.total - segStart >= NOISY_CUT ? floor * 1.7 : 0, 2e-4);
   let bestLen = 0, bestAt = -1, run = 0;
   for (let k = 0; k <= n; k++) {
     if (k < n && r[k] < thr) { run++; continue; }
     if (run >= 5 && run > bestLen) { bestLen = run; bestAt = k - run / 2; }
     run = 0;
   }
-  if (bestAt < 0) return false;
-  const cut = a + Math.round(bestAt * W);
+  let cut;
+  if (bestAt >= 0) cut = a + Math.round(bestAt * W);
+  // No pause at all (music, several people at once, heavy noise): a line still has to end. Cut at the
+  // quietest instant of the last few seconds rather than let one line grow without limit and
+  // be rewritten over and over while what was said earlier falls out of it.
+  else if (st.total - segStart >= FORCE_CUT) cut = quietestPoint(st, Math.max(a, st.total - RATE * 6), b);
+  else return false;
   emitSegment(id, st, segStart, cut, 'pause-cut', 0, { keep: st.recContig && !st.dirty });
   restartVadAt(st, cut);
   return true;
@@ -303,6 +328,7 @@ function flush(id, st) {
   st.contig = true;
 }
 
+let pressure = false; // the accuracy pass is queueing: leave it the CPU (see local-stt.js updatePressure)
 function onAudio(m) {
   const st = streams.get(m.id); if (!st) return;
   const samples = m.samples;
@@ -314,10 +340,10 @@ function onAudio(m) {
   if (lag > SHED_OFF) st.lastLagAt = Date.now();
   if (lag > st.statLag) st.statLag = lag;
   if (++st.statN >= 120) { parentPort.postMessage({ type: 'stat', id: m.id, lag: st.statLag, shed: st.shed }); st.statN = 0; st.statLag = 0; } // every ~10 s
-  if (!st.shed && lag > SHED_ON) {
+  if (!st.shed && (lag > SHED_ON || pressure)) {
     st.shed = true; st.dirty = true;
-    if (Date.now() - lastShedNote > 15000) { lastShedNote = Date.now(); log(m.id, `recognizer ${(lag / 1000).toFixed(1)} s behind: pausing live partial words to catch up (finished lines keep coming from the accuracy pass)`); }
-  } else if (st.shed && lag < SHED_OFF) { st.shed = false; st.needReset = true; }
+    if (lag > SHED_ON && Date.now() - lastShedNote > 15000) { lastShedNote = Date.now(); log(m.id, `recognizer ${(lag / 1000).toFixed(1)} s behind: pausing live partial words to catch up (finished lines keep coming from the accuracy pass)`); }
+  } else if (st.shed && lag < SHED_OFF && !pressure) { st.shed = false; st.needReset = true; }
 
   // 1. voice activity — always, cheap, on a fast-levelled copy so quiet speech is caught from its first syllable
   let speech = true, det = false;
@@ -363,6 +389,7 @@ function onAudio(m) {
 parentPort.on('message', (m) => {
   try {
     if (m.type === 'audio') onAudio(m);
+    else if (m.type === 'pressure') pressure = !!m.on;
     else if (m.type === 'init') {
       const t0 = Date.now();
       sherpa = require('sherpa-onnx-node');

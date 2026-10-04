@@ -141,4 +141,59 @@ const frames = (x, f = 1365) => { const out = []; for (let i = 0; i < x.length; 
   check('fast gain (detector copy): the quiet talker starts rising immediately and is at full level within ~1 s', rms(stream, q0 + 1600, q0 + 4800) > 0.0134 * 1.2 && rms(stream, q0 + 16000, q0 + 20000) > 0.08, [rms(stream, q0 + 1600, q0 + 4800), rms(stream, q0 + 16000, q0 + 20000)]);
   check('fast gain: never exceeds full scale', peak(stream) <= 1);
 }
+
+// 6. echo canceller — speech-like signals (modulated noise), a speaker->mic path with delay, tone and room decay
+{
+  const RATE = 16000, F = 1365, SEC = 30, N = RATE * SEC;
+  const voice = (seed, rate) => { let a = seed >>> 0, lp = 0, lp2 = 0; const x = new Float32Array(N); for (let i = 0; i < N; i++) { a = (Math.imul(a, 1664525) + 1013904223) >>> 0; const w = a / 2147483648 - 1; lp += 0.3 * (w - lp); lp2 += 0.05 * (w - lp2); const t = i / RATE; const env = Math.max(0, Math.sin(2 * Math.PI * rate * t)) * (Math.sin(2 * Math.PI * 0.23 * t + seed) > -0.6 ? 1 : 0); x[i] = 0.25 * env * (lp - lp2); } return x; };
+  const call = voice(7, 3.1), you = voice(99, 2.3);
+  const bleed = new Float32Array(N); { const d = Math.round(0.11 * RATE), comb = Math.round(0.047 * RATE); let lp = 0; for (let i = d; i < N; i++) { lp += 0.35 * (call[i - d] - lp); bleed[i] = 0.3 * lp + (i >= comb ? 0.3 * bleed[i - comb] : 0); } }
+  // blocks carry their clock position; output comes back at its own clock position (aec.outEnd)
+  const through = (mic, opts, jitter = false) => {
+    const aec = dsp.createEchoCanceller(opts); const out = new Float32Array(N); const verdicts = []; let got = 0;
+    let r = 5; const rand = () => { r = (Math.imul(r, 1664525) + 1013904223) >>> 0; return r / 4294967296; };
+    const sq = [], mq = [];
+    for (let o = 0; o + F <= N; o += F) {
+      sq.push(o); if (!jitter || o >= 8 * F) mq.push(o); // jitter: the mic opens 8 blocks late, and blocks arrive in bursts
+      for (const s of sq.splice(0, jitter && rand() < 0.5 ? Math.max(0, sq.length - 4) : sq.length)) aec.ref(call.subarray(s, s + F), s + F);
+      for (const m of mq.splice(0, jitter && rand() < 0.5 ? Math.max(0, mq.length - 4) : mq.length)) { const res = aec.mic(mic.subarray(m, m + F), m + F); out.set(res, aec.outEnd - res.length); got += res.length; if (res.length) verdicts.push({ ...aec.last, o: aec.outEnd - res.length }); }
+    }
+    return { out, verdicts, aec, got };
+  };
+  const LATE = 0;
+  // speakers, you silent: the bleed is removed and what is left is judged as residue
+  const a = through(bleed);
+  check('canceller: speaker bleed is at least 15 dB quieter after 10 s', db(rms(bleed, 10 * RATE, N - LATE)) - db(rms(a.out, 10 * RATE + LATE, N)) >= 15, db(rms(bleed, 10 * RATE, N - LATE)) - db(rms(a.out, 10 * RATE + LATE, N)));
+  const late = a.verdicts.filter((v) => v.o > 10 * RATE && rms(bleed, v.o - LATE, v.o - LATE + F) > 0.004);
+  check('canceller: knows it has learned the path, and calls bleed-only stretches "not you"', late.every((v) => v.converged) && late.filter((v) => v.user).length <= late.length * 0.05, late.filter((v) => v.user).length + '/' + late.length);
+  // speakers, you talking over the call: your voice comes through intact
+  const mix = bleed.map((v, i) => v + you[i]);
+  const b = through(mix);
+  let err = 0, ref = 0; for (let i = 12 * RATE; i < N - LATE; i++) { const e = b.out[i + LATE] - you[i]; err += e * e; ref += you[i] * you[i]; }
+  check('canceller: your voice over the call is preserved (what is left differs from your voice alone by < -10 dB)', 10 * Math.log10(err / ref) < -10, 10 * Math.log10(err / ref));
+  const talking = b.verdicts.filter((v) => v.o > 12 * RATE && rms(you, v.o - LATE, v.o - LATE + F) > 0.03);
+  check('canceller: stretches where you talk over the call are called "you"', talking.filter((v) => v.user).length >= talking.length * 0.97, talking.filter((v) => v.user).length + '/' + talking.length);
+  // headphones: the mic has nothing to do with the call audio — nothing may be removed or marked as bleed
+  const c = through(you);
+  check('canceller: on headphones your voice is not attenuated (within 1 dB)', Math.abs(db(rms(c.out, 5 * RATE + LATE, N)) - db(rms(you, 5 * RATE, N - LATE))) < 1, db(rms(c.out, 5 * RATE + LATE, N)) - db(rms(you, 5 * RATE, N - LATE)));
+  const hp = c.verdicts.filter((v) => rms(you, Math.max(0, v.o - LATE), Math.max(F, v.o - LATE + F)) > 0.03);
+  check('canceller: on headphones everything you say is called "you"', hp.filter((v) => v.user).length >= hp.length * 0.99, hp.filter((v) => v.user).length + '/' + hp.length);
+  // never louder than the input, whatever happens
+  let worse = 0; for (let o = LATE; o + F <= N; o += F) if (rms(b.out, o, o + F) > rms(mix, o - LATE, o - LATE + F) * 1.5 + 0.002) worse++;
+  check('canceller: never makes the microphone louder', worse === 0, worse);
+  // the call audio stops arriving: your voice still comes out
+  { const aec = dsp.createEchoCanceller(); let got = 0; for (let o = 0; o + F <= 5 * RATE; o += F) got += aec.mic(you.subarray(o + 5 * RATE, o + 5 * RATE + F), o + F).length; check('canceller: with no call audio at all, every microphone sample comes straight through', got >= 5 * RATE - F - 512, got); }
+  // the call audio stops arriving mid-way (its capture ended): the mic waits at most 0.5 s, then carries on
+  { const aec = dsp.createEchoCanceller(); let fed = 0, got = 0; for (let o = 0; o + F <= 20 * RATE; o += F) { if (o < 5 * RATE) aec.ref(call.subarray(o, o + F), o + F); got += aec.mic(you.subarray(o, o + F), o + F).length; fed += F; } check('canceller: when the call audio stops arriving, the mic is held back by at most 0.5 s, never lost', fed - got <= 8000 + 1024 + 512, fed - got); }
+  // a loaded computer: the mic opens late and the two streams' blocks arrive in uneven bursts
+  {
+    const j = through(bleed, {}, true);
+    const e1 = db(rms(bleed, 12 * RATE, N - 9000)) - db(rms(j.out, 12 * RATE, N - 9000));
+    check('canceller: uneven delivery and a late mic do not misalign it (bleed still 15 dB quieter)', e1 >= 15, e1);
+    const jm = through(mix, {}, true);
+    let err2 = 0, ref2 = 0; for (let i = 12 * RATE; i < N - 9000; i++) { const e = jm.out[i] - you[i]; err2 += e * e; ref2 += you[i] * you[i]; }
+    check('canceller: …and your voice still comes through intact (< -10 dB difference)', 10 * Math.log10(err2 / ref2) < -10, 10 * Math.log10(err2 / ref2));
+    check('canceller: …and no microphone audio is lost (only the last ≤0.5 s still waiting)', jm.got >= N - 8 * F - F - 8000 - 1024 - 512, [jm.got, N - 8 * F]);
+  }
+}
 console.log(`dsp: ${n} checks passed`);

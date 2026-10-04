@@ -33,6 +33,7 @@
       this.chain = {};   // per source: { rs, hp, agc }
       this.micQueue = [];
       this.gate = GhostDSP.createEchoGate({ micFloor: 0.0015 });
+      this.aec = GhostDSP.createEchoCanceller(); // removes the call audio your speakers put into the microphone
       this.lastRms = { system: 0, mic: 0 };
       this.stats = { chunksSent: 0, chunksSkippedSilent: 0, framesSent: 0, framesDucked: 0, lastRms: 0, engine: '' };
     }
@@ -68,10 +69,10 @@
         let node;
         if (worklet) {
           node = new AudioWorkletNode(this.ctx, 'ghost-capture', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1], channelCount: 1, channelCountMode: 'explicit', channelInterpretation: 'speakers' });
-          node.port.onmessage = (e) => { if (this.running) this._onSamples(name, e.data.buf, Math.max(0, (this.ctx.currentTime - e.data.t) * 1000)); };
+          node.port.onmessage = (e) => { if (this.running) this._onSamples(name, e.data.buf, Math.max(0, (this.ctx.currentTime - e.data.t) * 1000), e.data.t); };
         } else {
           node = this.ctx.createScriptProcessor(BLOCK, 1, 1);
-          node.onaudioprocess = (e) => { if (this.running) this._onSamples(name, new Float32Array(e.inputBuffer.getChannelData(0))); };
+          node.onaudioprocess = (e) => { if (this.running) this._onSamples(name, new Float32Array(e.inputBuffer.getChannelData(0)), 0, this.ctx.currentTime); };
         }
         src.connect(node); node.connect(sink);
         this.procs.push(node);
@@ -147,13 +148,14 @@
     }
 
     // waitMs: how long the block sat between being captured and this thread processing it (worklet path)
-    _onSamples(name, f32, waitMs = 0) {
+    // t: the audio clock (seconds) at the end of this block — the same clock for every source
+    _onSamples(name, f32, waitMs = 0, t = this.ctx ? this.ctx.currentTime : 0) {
       this.wait = waitMs;
       const t0 = performance.now();
-      try { this._process(name, f32); } finally { this.stats.dspMs = (this.stats.dspMs || 0) + (performance.now() - t0); this.stats.blocks = (this.stats.blocks || 0) + 1; }
+      try { this._process(name, f32, t); } finally { this.stats.dspMs = (this.stats.dspMs || 0) + (performance.now() - t0); this.stats.blocks = (this.stats.blocks || 0) + 1; }
     }
 
-    _process(name, f32) {
+    _process(name, f32, t) {
       const rms = GhostDSP.rmsOf(f32);
       this.lastRms[name] = rms;
       this.stats.lastRms = rms;
@@ -170,7 +172,10 @@
           // loopback is captured post-volume-slider, so "active" is an absolute floor
           // well above its silence level (~1e-5) but below quiet speech (~1e-2)
           if (rms > 0.002) this.lastSysActiveAt = now;
-          this.gate.system(GhostDSP.subRms(f32, this.rate), now);
+          // both sources are placed on the audio clock (ms): the gate and the canceller line them up by when
+          // the sound happened, not by the order their blocks happened to reach this thread
+          this.gate.system(GhostDSP.subRms(f32, this.rate), t * 1000);
+          if ('mic' in this.analysers) this.aec.ref(pcm, Math.round(t * TARGET_RATE)); // before the gain stage: the canceller wants the audio as it was played
           this._emitFrame(name, pcm, rms);
           return;
         }
@@ -180,10 +185,14 @@
         // never transcribed as "you"; a frame where you are talking — even over
         // the other side — is kept. On headphones nothing is ever silenced.
         if ('system' in this.analysers) {
-          this.micQueue.push({ pcm, rms, env: GhostDSP.subRms(f32, this.rate), at: now });
+          // first subtract what the call audio is predicted to sound like at the microphone; then let the
+          // gate judge what is left, with the canceller's own verdict on whether that is more than residue
+          const clean = this.aec.mic(pcm, Math.round(t * TARGET_RATE));
+          this.stats.echoDb = this.aec.last.converged ? -10 * Math.log10(this.aec.last.residue || 1) : 0; // how far below the call audio its residue on the mic is
+          if (clean.length) this.micQueue.push({ pcm: clean, rms, env: GhostDSP.subRms(clean, TARGET_RATE), at: this.aec.outEnd / (TARGET_RATE / 1000), hint: this.aec.last });
           while (this.micQueue.length > 1) {
             const f = this.micQueue.shift();
-            if (this.gate.mic(f.env, f.at).duck) { this.stats.framesDucked++; this._emitFrame('mic', new Float32Array(f.pcm.length), 0, true); }
+            if (this.gate.mic(f.env, f.at, f.hint).duck) { this.stats.framesDucked++; this._emitFrame('mic', new Float32Array(f.pcm.length), 0, true); }
             else this._emitFrame('mic', f.pcm, f.rms);
           }
           return;
