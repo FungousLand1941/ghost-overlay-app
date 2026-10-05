@@ -151,11 +151,35 @@ async function* stream(cfg, { messages, system, signal }) {
   }
 }
 
-// Audio transcription needs a model that accepts audio -> Gemini only.
+function wavToFloat32(wavBase64) {
+  const buf = Buffer.from(wavBase64, 'base64');
+  let dataOffset = 44;
+  const dataPos = buf.indexOf('data');
+  if (dataPos !== -1 && dataPos + 8 <= buf.length) {
+    dataOffset = dataPos + 8;
+  }
+  const numSamples = Math.floor((buf.length - dataOffset) / 2);
+  if (numSamples <= 0) return new Float32Array(0);
+  const f32 = new Float32Array(numSamples);
+  for (let i = 0; i < numSamples; i++) {
+    f32[i] = buf.readInt16LE(dataOffset + i * 2) / 32768;
+  }
+  return f32;
+}
+
+// Audio transcription: uses Gemini if key provided, otherwise local offline Sherpa-ONNX model
 async function transcribe(cfg, { wavBase64, context }) {
   const key = cfg.gemini?.apiKey;
-  if (!key) throw new Error('Live listening needs a Gemini API key (Claude does not accept audio input). Add one in settings.');
-  return gemini.transcribe({ apiKey: key, model: cfg.transcription?.model || 'gemini-2.5-flash', wavBase64, context });
+  if (key) {
+    return gemini.transcribe({ apiKey: key, model: cfg.transcription?.model || 'gemini-2.5-flash', wavBase64, context });
+  }
+  const localStt = require('./local-stt');
+  if (localStt.modelReady() || localStt.modelReady(localStt.REFINE_MODEL)) {
+    const samples = wavToFloat32(wavBase64);
+    if (!samples.length) return '';
+    return localStt.transcribeSamples(samples);
+  }
+  throw new Error('Transcription needs a Gemini API key or local speech model downloaded.');
 }
 
 // One tiny real request so the settings panel can confirm a key works.
