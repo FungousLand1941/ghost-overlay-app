@@ -19,13 +19,23 @@ const {
   screen, session, shell, systemPreferences,
 } = require('electron');
 const path = require('path');
-const store = require('./src/store');
-const providers = require('./src/providers');
 
 const SMOKE = !!process.env.GHOST_SMOKE;
 // Smoke runs must never touch the real config (they write dummy keys).
 if (SMOKE) app.setPath('userData', path.join(require('os').tmpdir(), 'ghost-smoke-userdata'));
 else if (process.env.GHOST_USERDATA) app.setPath('userData', process.env.GHOST_USERDATA); // test harnesses: isolated config, never the real one
+
+// Only one Ghost at a time. A second copy (Ghost.exe double-clicked again while it starts — the
+// portable build takes a few seconds to unpack — or while it sits in the tray) hands over to the
+// running one and stops HERE, before it loads anything else: it must not depend on, or touch,
+// files the running copy is using.
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+  return; // (a CommonJS module may return early)
+}
+
+const store = require('./src/store');
+const providers = require('./src/providers');
 const DEFAULT_W = 680;
 const DEFAULT_H = 660;
 const MIN_W = 640; // header holds two big buttons + mode toggle + 7 icons + Quit
@@ -1073,10 +1083,7 @@ async function runSmoke() {
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
-const gotLock = app.requestSingleInstanceLock();
-if (!gotLock) app.quit();
-
-app.on('second-instance', () => { if (win) { win.show(); win.focus(); } });
+app.on('second-instance', () => { log('[ghost] started again while running: showing this copy'); if (win) { ensureOnScreen(); win.show(); win.focus(); } });
 
 app.whenReady().then(async () => {
   if (process.platform === 'darwin') {

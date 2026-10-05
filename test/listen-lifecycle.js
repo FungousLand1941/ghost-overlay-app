@@ -9,7 +9,9 @@
 //   3. Stop mid-sentence -> capture stops, and that sentence is still kept
 //   4. Stop during a start that is failing over to chunked mode -> stays stopped
 //
-//   node test/listen-lifecycle.js      (Linux without a display: uses xvfb-run)
+//   node test/listen-lifecycle.js [--exe path\to\win-unpacked\Ghost.exe]
+//     --exe   test a packaged build (its unpacked folder) instead of the source tree
+//   (Linux without a display: uses xvfb-run)
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -18,6 +20,7 @@ process.env.MOCK_LIVE_HOLD_TURN = '1'; // the mock speaker never finishes the se
 const { startMock } = require('./mock-live');
 
 const ROOT = path.join(__dirname, '..');
+const EXE = (() => { const i = process.argv.indexOf('--exe'); return i > 0 ? path.resolve(process.argv[i + 1]) : null; })();
 const RATE = 16000;
 let failures = 0;
 const check = (n, c, x = '') => { console.log(`${c ? 'ok' : 'FAIL'} ${n}${x ? ` — ${x}` : ''}`); if (!c) failures++; };
@@ -35,8 +38,8 @@ fs.writeFileSync(call, track(7, 0.12)); fs.writeFileSync(mic, track(11, 0.06));
 const wss = startMock(0);
 wss.on('listening', () => {
   const env = { ...process.env, GHOST_SMOKE: 'listen', GHOST_FAKE_AUDIO: `${call};${mic}`, GEMINI_LIVE_URL: `ws://127.0.0.1:${wss.address().port}`, GHOST_SMOKE_OUT: dir };
-  const electron = require('electron'); // the binary's path, from Node
-  let cmd = electron, args = ['.'];
+  const electron = EXE || require('electron'); // the packaged app, or the Electron binary (its path, from Node)
+  let cmd = electron, args = EXE ? [] : ['.'];
   if (process.platform === 'linux') {
     args.push('--no-sandbox');
     if (!process.env.DISPLAY) { args = ['-a', electron, ...args]; cmd = 'xvfb-run'; }
