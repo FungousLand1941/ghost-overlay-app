@@ -151,35 +151,46 @@ async function* stream(cfg, { messages, system, signal }) {
   }
 }
 
+// WAV (any rate, 16-bit PCM) -> mono float samples at 16 kHz, for the local recognizer.
 function wavToFloat32(wavBase64) {
   const buf = Buffer.from(wavBase64, 'base64');
-  let dataOffset = 44;
-  const dataPos = buf.indexOf('data');
-  if (dataPos !== -1 && dataPos + 8 <= buf.length) {
-    dataOffset = dataPos + 8;
+  if (buf.length < 12 || buf.toString('ascii', 0, 4) !== 'RIFF' || buf.toString('ascii', 8, 12) !== 'WAVE') throw new Error('audio chunk is not a WAV file');
+  let fmt = null;
+  for (let o = 12; o + 8 <= buf.length;) {
+    const id = buf.toString('ascii', o, o + 4), size = buf.readUInt32LE(o + 4), body = o + 8;
+    if (id === 'fmt ' && body + 16 <= buf.length) fmt = { format: buf.readUInt16LE(body), channels: buf.readUInt16LE(body + 2) || 1, rate: buf.readUInt32LE(body + 4), bits: buf.readUInt16LE(body + 14) };
+    else if (id === 'data') {
+      if (!fmt || fmt.format !== 1 || fmt.bits !== 16) throw new Error('audio chunk is not 16-bit PCM');
+      const ch = fmt.channels, end = Math.min(buf.length, body + size), n = Math.floor((end - body) / (2 * ch));
+      let x = new Float32Array(n);
+      for (let i = 0; i < n; i++) { let v = 0; for (let c = 0; c < ch; c++) v += buf.readInt16LE(body + (i * ch + c) * 2); x[i] = v / ch / 32768; }
+      if (fmt.rate !== 16000 && n) {
+        const rs = require('../renderer/dsp').createResampler(fmt.rate, 16000);
+        const padded = new Float32Array(n + Math.ceil(fmt.rate * 0.02)); padded.set(x); // flush the filter's look-ahead
+        x = Float32Array.from(rs.process(padded).subarray(0, Math.round((n * 16000) / fmt.rate)));
+      }
+      return x;
+    }
+    o = body + size + (size & 1);
   }
-  const numSamples = Math.floor((buf.length - dataOffset) / 2);
-  if (numSamples <= 0) return new Float32Array(0);
-  const f32 = new Float32Array(numSamples);
-  for (let i = 0; i < numSamples; i++) {
-    f32[i] = buf.readInt16LE(dataOffset + i * 2) / 32768;
-  }
-  return f32;
+  throw new Error('audio chunk has no audio data');
 }
 
-// Audio transcription: uses Gemini if key provided, otherwise local offline Sherpa-ONNX model
+// Chunked transcription: Gemini when there is a Gemini key, otherwise on this computer with the
+// offline accuracy model (no key, no quota — e.g. a Claude-only setup).
+function transcribesLocally(cfg) { return !cfg.gemini?.apiKey; }
 async function transcribe(cfg, { wavBase64, context }) {
-  const key = cfg.gemini?.apiKey;
-  if (key) {
-    return gemini.transcribe({ apiKey: key, model: cfg.transcription?.model || 'gemini-2.5-flash', wavBase64, context });
-  }
+  if (!transcribesLocally(cfg)) return gemini.transcribe({ apiKey: cfg.gemini.apiKey, model: cfg.transcription?.model || 'gemini-2.5-flash', wavBase64, context });
   const localStt = require('./local-stt');
-  if (localStt.modelReady() || localStt.modelReady(localStt.REFINE_MODEL)) {
-    const samples = wavToFloat32(wavBase64);
-    if (!samples.length) return '';
-    return localStt.transcribeSamples(samples);
+  if (!localStt.modelReady(localStt.REFINE_MODEL)) {
+    // a first run: fetch the model in the background (progress shows in the status line) rather than
+    // holding this chunk — and every chunk after it — for the minutes the download takes
+    localStt.startRefiner().catch(() => {});
+    throw Object.assign(new Error(`downloading the offline speech model (~${localStt.REFINE_MODEL.approxMB} MB, once) — chunked transcription starts by itself when it is ready (or add a Gemini API key to transcribe online)`), { code: 'LOCAL_LOADING' });
   }
-  throw new Error('Transcription needs a Gemini API key or local speech model downloaded.');
+  const samples = wavToFloat32(wavBase64);
+  if (!samples.length) return '';
+  return localStt.transcribeSamples(samples);
 }
 
 // One tiny real request so the settings panel can confirm a key works.
@@ -196,4 +207,4 @@ async function testKey(cfg, { provider, apiKey }) {
   return { ok: true, model: testCfg[provider].model, ms: Date.now() - t0, reply: text.trim().slice(0, 40) };
 }
 
-module.exports = { MODELS, PROVIDER_LABEL, hasKey, effectiveProvider, fallbackOrder, stream, transcribe, testKey, summarize, digest, cleanupTranscript, systemPrompt, modeConfig, PROFILES: prompts.PROFILES };
+module.exports = { MODELS, PROVIDER_LABEL, hasKey, effectiveProvider, fallbackOrder, stream, transcribe, transcribesLocally, wavToFloat32, testKey, summarize, digest, cleanupTranscript, systemPrompt, modeConfig, PROFILES: prompts.PROFILES };

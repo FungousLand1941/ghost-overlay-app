@@ -200,7 +200,7 @@ class LiveTranscriber extends EventEmitter {
   sendAudio(base64Pcm16) {
     const frame = JSON.stringify({ realtimeInput: { audio: { data: base64Pcm16, mimeType: `audio/pcm;rate=${this.sampleRate}` } } });
     if (this.ready && this.ws?.readyState === WebSocket.OPEN) { this.ws.send(frame); this.framesSent = (this.framesSent || 0) + 1; }
-    else { this.queue.push(frame); if (this.queue.length > 40) this.queue.shift(); } // keep ~10 s
+    else { this.queue.push(frame); if (this.queue.length > 120) this.queue.shift(); } // keep ~10 s (frames are ~85 ms) across a reconnect
   }
 
   _flushQueue() {

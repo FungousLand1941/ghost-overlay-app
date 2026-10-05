@@ -382,7 +382,7 @@
   }
   async function togglePause() {
     const next = !aiPaused;
-    if (next && listener) stopListening();
+    if (next && (listener || listenStarting)) stopListening();
     renderStats(await window.ghost.aiPause(next));
     toast(next ? '⏸ AI paused — nothing will be sent to Gemini/Claude until you press ▶' : '▶ AI resumed');
   }
@@ -390,7 +390,7 @@
   $('req-tag').addEventListener('click', () => toast($('req-tag').title.split('\n')[0]));
   window.ghost.onAiEvent((ev) => { if (ev.type === 'stats') renderStats(ev.stats); });
   window.ghost.aiStats().then(renderStats);
-  $('btn-stop-listen').addEventListener('click', () => { if (listener) stopListening(); });
+  $('btn-stop-listen').addEventListener('click', () => { if (listener || listenStarting) stopListening(); });
   $('btn-reset').addEventListener('click', resetConversation);
   $('btn-hide').addEventListener('click', () => { toast('Hidden — press ' + shortcutLabel('toggle') + ' or use the tray icon to bring Ghost back'); setTimeout(() => window.ghost.hide(), 700); });
   // Quit: flush state to disk first so nothing from the last second is lost.
@@ -404,8 +404,15 @@
   let meterTimer = null;
   let backoffUntil = 0;
   const pendingTranscriptions = new Set();
-  let listenMode = null;     // 'live' | 'chunk' while listening
+  let listenMode = null;     // 'live' | 'chunk' while listening (and while starting)
   let listenEngine = null;   // 'local' | 'gemini' | 'chunk' — what is actually transcribing
+  // Every start / stop of listening bumps listenGen; anything a start was still waiting for (the
+  // devices, the recognizers) checks it when it arrives and backs out if it is stale. Without this, a
+  // second press (or the hotkey) while starting left a capture running nobody could stop, feeding
+  // every frame twice into the recognizer, and Stop pressed during a slow start started chunked mode.
+  let listenGen = 0;
+  let listenStarting = false;
+  let lateLinesUntil = 0;    // after Stop: the last sentence is still being finished — keep it
   let interimText = '';      // words currently being spoken (streaming mode)
   let interimSpeaker = '';
   let interimAt = 0;
@@ -547,7 +554,7 @@
     elStatus.textContent = text;
     elStatus.classList.toggle('err', isErr);
   }
-  let silenceWarned = false;
+  let silenceWarned = false; // false | 'shown' | 'done'
   const meterShown = {};
   // The default-output loopback is silent while a virtual mix device (a Voicemeeter
   // bus, Stereo Mix, VB-Cable, BlackHole…) is carrying audio: the call is routed
@@ -577,23 +584,27 @@
       probes.forEach((p) => p.s.getTracks().forEach((t) => t.stop())); try { ctx.close(); } catch {}
       const best = probes.sort((a, b) => b.max - a.max)[0];
       if (best && best.max > 0.003 && listener && listener.sysLiveFrames === 0) {
-        const mode = listenMode;
+        const mode = listenMode, gen = listenGen;
         cfg = await window.ghost.setConfig({ transcription: { callDevice: best.d.deviceId } });
-        listener.stop(); listener = null;
-        await startCapture(mode);
+        if (gen !== listenGen || !listener) return; // stopped meanwhile
+        listener.stop(); listener = null; listenStarting = true;
+        try { await startCapture(mode, gen); } finally { if (gen === listenGen) listenStarting = false; }
         setStatus(`call audio found on "${best.d.label}" (the default output is silent) — switched to it`);
         toast(`Call audio: switched to "${best.d.label}" because the default output was silent. Change it in ⚙ → call audio device.`);
       }
-    } catch (e) { setStatus(`could not switch call audio device: ${e.message}`, true); } finally { rescue.busy = false; }
+    } catch (e) { if (!e.cancelled) { setStatus(`could not switch call audio device: ${e.message}`, true); if (!listener && listenMode) stopListening(); } } finally { rescue.busy = false; }
   }
   function renderMeters() {
     if (listener && 'system' in listener.analysers && listener.sysFrames > 36 && listener.sysLiveFrames === 0 && (cfg.transcription.callDevice || 'loopback') === 'loopback') rescueSilentLoopback();
     // Loopback is captured after Windows' volume/mute stage: muted speakers =
-    // pure digital silence. Say so instead of silently hearing nothing.
-    if (listener && !silenceWarned && 'system' in listener.analysers && listener.sysFrames > 24 && listener.sysLiveFrames === 0) {
-      silenceWarned = true;
-      setStatus('system audio is pure silence — are your speakers muted / volume 0? Unmute (headphones are fine), or pick a capture device in ⚙', true);
+    // pure digital silence. Say so instead of silently hearing nothing — but only
+    // after a while: nothing playing yet (the call has not started, nobody has
+    // spoken) is the same digital silence, and is not a fault.
+    if (listener && !silenceWarned && 'system' in listener.analysers && listener.sysFrames > 140 && listener.sysLiveFrames === 0) {
+      silenceWarned = 'shown';
+      setStatus('no call audio for 12 s — if the call is playing, are your speakers muted / volume 0? Unmute (headphones are fine), or pick a capture device in ⚙', true);
     }
+    if (listener && silenceWarned === 'shown' && listener.sysLiveFrames > 0) { silenceWarned = 'done'; setStatus('call audio is coming through'); }
     if (document.hidden) return; // overlay hidden: nothing to draw
     const lv = listener ? listener.levels() : {};
     for (const name of ['system', 'mic']) {
@@ -610,10 +621,15 @@
   // Events from the streaming transcribers in the main process (one per source).
   const liveErrors = new Set();
   window.ghost.onLiveEvent((ev) => {
-    if (listenMode !== 'live') return;
+    // after Stop, the sentence that was being spoken is still finished (and refined) for a few seconds: keep it
+    const late = !listenMode && Date.now() < lateLinesUntil && (ev.type === 'final' || ev.type === 'revise');
+    // chunked mode shows the offline model's download / load progress
+    const chunkStatus = listenMode === 'chunk' && ev.type === 'status' && !ev.speaker;
+    if (listenMode !== 'live' && !late && !chunkStatus) return;
     if (ev.type === 'interim') setInterim(ev.text, ev.speaker);
     else if (ev.type === 'final') {
       addTranscript(ev.text, ev.speaker, { uid: ev.uid, provisional: ev.provisional, at: ev.at });
+      if (late) return;
       setInterim('');
       setStatus(`${ev.speaker || 'heard'}: ${ev.text.split(/\s+/).length} words${ev.provisional ? ' (refining…)' : ''} · ${new Date().toLocaleTimeString()}`);
     } else if (ev.type === 'revise') {
@@ -622,6 +638,7 @@
       if (e) { if (ev.text) e.text = ev.text; e.provisional = false; updateLine(e); persist(); }
     } else if (ev.type === 'status') { if (/switched to local|using local offline/i.test(ev.text)) listenEngine = 'local'; setStatus(ev.text); }
     else if (ev.type === 'error') {
+      if (!listener) { setStatus(ev.text, true); return; } // still starting: the start itself reports whether it worked
       liveErrors.add(ev.source);
       const active = (listener && Object.keys(listener.analysers)) || [];
       const allDead = active.every((s) => liveErrors.has(s));
@@ -657,7 +674,7 @@
           backoffUntil = Date.now() + 60000;
           if (state.limited >= 3) { stopListening(); setStatus(`chunked transcription stopped after repeated rate limits (${r.error}) — nothing more will be spent. Press 🎙 to retry later.`, true); return; }
         }
-        setStatus(r.error, true);
+        setStatus(r.error, r.code !== 'LOCAL_LOADING');
       } else if (r.text) {
         state.limited = 0;
         addTranscript(r.text);
@@ -668,7 +685,7 @@
     } finally { state.inFlight--; pendingTranscriptions.delete(token); }
   }
 
-  async function startCapture(mode) {
+  async function startCapture(mode, gen = listenGen) {
     const source = cfg.transcription.sourceOverride || cfg.transcription.source || 'both';
     const chunkSeconds = Math.max(3, Math.min(20, +cfg.transcription.chunkSeconds || 5));
     const state = { inFlight: 0 };
@@ -676,12 +693,13 @@
       source,
       callDevice: cfg.transcription.callDevice || 'loopback',
       chunkSeconds,
-      onStatus: (t) => setStatus(t),
+      onStatus: (t) => { if (gen === listenGen) setStatus(t); },
       onFrame: mode === 'live' ? (src, b64, info) => window.ghost.liveAudio(src, b64, info && info.wait) : null,
       onChunk: mode === 'chunk' ? (wav, info) => transcribeChunk(wav, info, state) : null,
-      onError: (e) => { setStatus(e.message, true); stopListening(); },
+      onError: (e) => { if (listener !== l) return; setStatus(e.message, true); stopListening(); },
     });
     const started = await l.start();
+    if (gen !== listenGen) { l.stop(); throw Object.assign(new Error('cancelled'), { cancelled: true }); } // stopped (or restarted) while the devices were opening
     listener = l;
     listenMode = mode;
     return started;
@@ -689,16 +707,33 @@
 
   async function switchToChunkMode() {
     if (listenMode !== 'live') return;
-    await window.ghost.liveStop();
-    listener?.stop(); listener = null;
-    try { await startCapture('chunk'); listenEngine = 'chunk'; } catch (e) { setStatus(`could not restart audio: ${e.message}`, true); stopListening(); }
+    const gen = listenGen;
+    listenStarting = true;
+    try {
+      await window.ghost.liveStop();
+      if (gen !== listenGen) return;
+      listener?.stop(); listener = null;
+      listenMode = 'chunk';
+      await startCapture('chunk', gen);
+      listenEngine = cfg.gemini.apiKeySet ? 'chunk' : 'local';
+    } catch (e) { if (!e.cancelled && gen === listenGen) { setStatus(`could not restart audio: ${e.message}`, true); stopListening(); } }
+    finally { if (gen === listenGen) listenStarting = false; }
   }
 
   async function toggleListen() {
-    if (listener) { stopListening(); return; }
+    if (listener || listenStarting) { stopListening(); return; }
     if (aiPaused) { toast('AI is paused — press ▶ to resume before listening', true); return; }
+    const gen = ++listenGen;
+    listenStarting = true;
+    $('btn-listen').classList.add('active'); // pressing it again now cancels the start
+    try { await startListening(gen); }
+    finally { if (gen === listenGen) { listenStarting = false; if (!listener) $('btn-listen').classList.remove('active'); } }
+  }
+
+  async function startListening(gen) {
     // No Gemini key? Fine — the main process falls back to the free local engine
     // automatically (transcription never depends on which provider answers).
+    const gemini = (cfg.transcription.engine || 'gemini') === 'gemini' && cfg.gemini.apiKeySet;
     if ((cfg.transcription.engine || 'gemini') === 'gemini' && !cfg.gemini.apiKeySet) toast('No Gemini key — transcribing with the free local engine (works with Claude / NavyAI answers)');
     el.transcript.classList.remove('hidden');
     liveErrors.clear();
@@ -708,47 +743,56 @@
     let mode = cfg.transcription.mode || 'live';
     let liveInfo = null, started = null, startErr = null;
     if (mode === 'live') {
-      setStatus('connecting to Gemini Live…');
+      listenMode = 'live'; // from now on the recognizers' progress (downloads, loading) shows in the status line
+      setStatus(gemini ? 'connecting to Gemini Live…' : 'starting the local speech engine…');
       const source = cfg.transcription.sourceOverride || cfg.transcription.source || 'both';
       const sources = source === 'both' ? ['system', 'mic'] : [source];
       // Capture starts at once, in parallel with loading the recognizer: the main process holds the
       // frames until it is ready, so what is said in the first seconds after pressing Listen is kept.
       const starting = window.ghost.liveStart({ sources });
-      try { started = await startCapture('live'); } catch (e) { startErr = e; }
+      try { started = await startCapture('live', gen); } catch (e) { startErr = e; }
       const r = await starting;
+      if (gen !== listenGen) return; // stopped while starting: stopListening has cleaned up
       if (r.ok) liveInfo = r;
       else {
-        mode = 'chunk'; setStatus(`streaming unavailable (${r.error}) — using chunked mode`, true);
+        mode = 'chunk'; listenMode = 'chunk';
+        setStatus(`streaming unavailable (${r.error}) — using chunked mode`, true);
         if (listener) { listener.stop(); listener = null; } started = null; startErr = null;
       }
     }
 
     try {
       if (startErr) throw startErr;
-      if (!started) started = await startCapture(mode);
+      if (!started) started = await startCapture(mode, gen);
     } catch (e) {
+      if (e.cancelled || gen !== listenGen) return;
       if (mode === 'live') await window.ghost.liveStop();
+      if (gen !== listenGen) return;
+      listenMode = null;
       toast(`Could not start audio: ${e.message}`, true);
       setStatus(`could not start: ${e.message}`, true);
       return;
     }
-    listenEngine = mode === 'chunk' ? 'chunk' : (String(liveInfo.model || '').startsWith('local:') ? 'local' : 'gemini');
+    listenEngine = mode === 'chunk' ? (cfg.gemini.apiKeySet ? 'chunk' : 'local') : (String(liveInfo.model || '').startsWith('local:') ? 'local' : 'gemini');
     el.listenTag.classList.remove('hidden');
     $('btn-listen').classList.add('active');
     setDot('listening', 'Listening');
-    meterTimer = setInterval(renderMeters, 150);
+    clearInterval(meterTimer); meterTimer = setInterval(renderMeters, 150);
     const what = started.active.map((n) => (n === 'system' ? 'the call' : 'your mic')).join(' + ');
     const how = mode === 'live'
       ? (String(liveInfo.model).startsWith('local:') ? 'local offline transcription (free, no quota)' : `streaming via ${liveInfo.model}`) + (liveInfo.failed && liveInfo.failed.length ? ` (${liveInfo.failed.join('; ')})` : '')
-      : `chunked every ${cfg.transcription.chunkSeconds || 10} s`;
+      : `chunked every ${cfg.transcription.chunkSeconds || 10} s${cfg.gemini.apiKeySet ? '' : ' on this computer'}`;
     if (mode === 'live' || !elStatus.classList.contains('err')) setStatus(started.errors.length ? `listening to ${what}, ${how} (${started.errors.join('; ')})` : `listening to ${what}, ${how}`);
     toast(`Listening to ${what} — ${shortcutLabel('answerAudio')} to answer`);
   }
 
   function stopListening() {
+    listenGen++; // anything still starting backs out
+    listenStarting = false;
+    if (listenMode === 'live') lateLinesUntil = Date.now() + 20000;
     listener?.stop();
     listener = null;
-    if (listenMode === 'live') window.ghost.liveStop();
+    window.ghost.liveStop(); // idempotent; also cancels recognizers that are still starting
     listenMode = null;
     clearInterval(meterTimer); meterTimer = null;
     renderMeters();
@@ -821,7 +865,7 @@
     $('s-local-model').value = cfg.transcription.localModel || 'nemo-fastconformer-en-80ms';
     $('s-refine').checked = cfg.transcription.refine !== false;
     $('s-aicleanup').value = cfg.aiCleanup || 'auto';
-    window.ghost.sttModel().then((m) => { $('s-model-status').textContent = m.ready ? `Local model ready (${(m.bytes / 1e6).toFixed(0)} MB, English streaming Zipformer, on disk)` : 'Local model not downloaded yet — it downloads automatically (~72 MB, once) the first time you press 🎙.'; });
+    window.ghost.sttModel().then((m) => { $('s-model-status').textContent = m.ready ? `Local model ready: ${m.label} (${(m.bytes / 1e6).toFixed(0)} MB on disk)` : `Local model not downloaded yet: ${m.label} — it downloads automatically (once) the first time it is needed.`; });
     fillCallDevices();
     $('s-transcription-mode').value = cfg.transcription.mode || 'live';
     fillSelect($('s-live-model'), MODELS.live, cfg.transcription.liveModel);

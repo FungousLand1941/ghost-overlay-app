@@ -308,15 +308,31 @@ ipcMain.handle('provider:test', async (_e, { provider, apiKey }) => {
 // One session per audio source so lines come back labelled: system -> "them", mic -> "you".
 const SPEAKER = { system: 'them', mic: 'you' };
 let live = {}; // source -> LiveTranscriber
-function stopLive() { liveGen++; for (const t of Object.values(live)) { try { t.close(); } catch {} } live = {}; }
+// A source whose recognizer is still starting (a cold start, a first-run download, a switch from
+// Gemini Live to the local engine mid-call): what it captures meanwhile is kept here — up to ~20 s —
+// and handed over the moment the recognizer is up, instead of being dropped.
+const starting = {};   // source -> liveGen of the start in progress
+const earlyAudio = {}; // source -> [base64 frames]
+function stopLive() {
+  liveGen++;
+  for (const t of Object.values(live)) { try { t.close(); } catch {} }
+  live = {};
+  for (const k of Object.keys(starting)) delete starting[k];
+  for (const k of Object.keys(earlyAudio)) delete earlyAudio[k];
+}
 // Start (or restart) transcription for one audio source with a given engine.
 // Gemini Live is the accurate one; if it can't connect, is rejected, or runs
 // out of quota — now or later mid-call — the source silently moves to the
 // local offline engine so transcription never just stops.
 let liveGen = 0;
 async function startSource(source, engine, cfg) {
-  const speaker = SPEAKER[source];
   const gen = liveGen;
+  starting[source] = gen;
+  try { return await openSource(source, engine, cfg, gen); }
+  finally { if (starting[source] === gen) delete starting[source]; }
+}
+async function openSource(source, engine, cfg, gen) {
+  const speaker = SPEAKER[source];
   const { LiveTranscriber } = require('./src/providers/gemini-live');
   const t = engine === 'gemini'
     ? new LiveTranscriber({ apiKey: cfg.gemini.apiKey, model: cfg.transcription?.liveModel, sampleRate: 16000 })
@@ -338,6 +354,7 @@ async function startSource(source, engine, cfg) {
       if (err.code === 'QUOTA') { governor.noteError(err); }
       send('live:event', { type: 'status', text: `${speaker}: Gemini Live ${err.code === 'QUOTA' ? 'quota exhausted' : 'failed'} → switched to local offline transcription`, speaker, source });
       try { t.close(); } catch {}
+      delete live[source]; // from here until the local engine is up, this source's audio is kept for it, not fed to the closed session
       try { await startSource(source, 'local', cfg); } catch (e2) { send('live:event', { type: 'error', text: `${err.message}; local fallback failed too: ${e2.message}`, speaker, source }); }
       return;
     }
@@ -366,9 +383,8 @@ ipcMain.handle('live:start', async (_e, { sources } = {}) => {
   stopLive(); liveGen++;
   const wanted = (sources && sources.length ? sources : ['system']).filter((s) => SPEAKER[s]);
   log('[live] starting sources', wanted, 'engine', engine, engine === 'gemini' ? `model ${cfg.transcription?.liveModel}` : `local model ready=${localStt.modelReady()}`, 'electron', process.versions.electron);
-  if (engine !== 'gemini' && !localStt.modelReady()) send('live:event', { type: 'status', text: 'first run: downloading the free speech model (~72 MB, once)…' });
-  for (const k of Object.keys(earlyAudio)) delete earlyAudio[k];
-  liveStarting = true;
+  const needMB = engine === 'gemini' ? 0 : localStt.downloadNeededMB();
+  if (needMB) send('live:event', { type: 'status', text: `first run: downloading the free offline speech models (~${needMB} MB, once) — listening starts by itself when they are ready; what is said meanwhile is kept (last ~20 s)` });
   for (const k of Object.keys(hop)) delete hop[k]; hopAt = 0;
   boostCapture();
   if (process.env.GHOST_PROFILE) profilePage(+process.env.GHOST_PROFILE || 60);
@@ -386,7 +402,6 @@ ipcMain.handle('live:start', async (_e, { sources } = {}) => {
       return { source, ok: false, error: err.message };
     }
   }));
-  liveStarting = false;
   const ok = results.filter((r) => r.ok);
   if (!ok.length) return { ok: false, error: results.map((r) => `${SPEAKER[r.source]}: ${r.error}`).join(' | ') };
   return { ok: true, model: ok[0].model, sources: ok.map((r) => r.source), failed: results.filter((r) => !r.ok).map((r) => `${SPEAKER[r.source]}: ${r.error}`) };
@@ -432,15 +447,13 @@ ipcMain.on('live:audio', (_e, { source, data, wait, sent }) => {
   if (audioDump) { try { require('fs').appendFileSync(path.join(app.getPath('userData'), `dump-${source}.pcm`), Buffer.from(data, 'base64')); } catch {} }
   const t = live[source];
   if (t) t.sendAudio(data);
-  else if (liveStarting) {
+  else if (starting[source] === liveGen) {
     // capture starts at once, the recognizer takes a few seconds to load on a cold start:
     // keep what is said meanwhile (up to ~20 s per source) and hand it over when it is ready
     const q = earlyAudio[source] || (earlyAudio[source] = []);
     q.push(data); if (q.length > 240) q.shift();
   }
 });
-let liveStarting = false;
-const earlyAudio = {};
 ipcMain.handle('live:nudge', () => { for (const t of Object.values(live)) t.nudge(); });
 ipcMain.handle('live:pendingRevisions', () => localStt.refinePending());
 ipcMain.handle('live:stop', () => stopLive());
@@ -551,6 +564,7 @@ ipcMain.handle('ai:pause', (_e, paused) => {
 const localStt = require('./src/providers/local-stt');
 localStt.init(() => process.env.GHOST_MODELS || path.join(app.getPath('userData'), 'models')); // GHOST_MODELS: reuse real models in self-test
 localStt.onRefineLog = (line) => { log('[stt:accuracy]', line); send('live:event', { type: 'status', text: line }); };
+localStt.onLog = (line) => { log('[stt]', line); send('live:event', { type: 'status', text: line }); };
 app.whenReady().then(() => { const t = store.get().transcription || {}; localStt.setModel(t.localModel); localStt.setRefine(t.refine !== false); });
 ipcMain.handle('stt:model', async (_e, { download } = {}) => {
   if (download) {
@@ -797,10 +811,13 @@ ipcMain.handle('session:load', () => {
 ipcMain.handle('session:clear', () => { try { require('fs').unlinkSync(SESSION_FILE()); } catch {} return true; });
 
 ipcMain.handle('audio:transcribe', async (_e, { wavBase64, context }) => {
-  const blocked = gate('transcribe');
-  if (blocked) return { error: blocked, code: 'GOVERNOR' };
-  try { return { text: await providers.transcribe(store.get(), { wavBase64, context }) }; }
-  catch (err) { noteProviderError(err); return { error: err.message || String(err), code: err.code || null }; }
+  const cfg = store.get();
+  // Transcribing on this computer (no Gemini key) sends no request: it is not budgeted like one,
+  // and a rate limit on the answering provider must not stop it.
+  const local = providers.transcribesLocally(cfg);
+  if (!local) { const blocked = gate('transcribe'); if (blocked) return { error: blocked, code: 'GOVERNOR' }; }
+  try { return { text: await providers.transcribe(cfg, { wavBase64, context }) }; }
+  catch (err) { if (!local) noteProviderError(err); return { error: err.message || String(err), code: err.code || null }; }
 });
 
 ipcMain.handle('win:hide', () => win && win.hide());
@@ -905,6 +922,41 @@ async function runSmoke() {
       for (let k = 0; k < 150 && localStt.refinePending() > 0; k++) await wait(200);
       await wait(800);
       results.stt = { logs: out.logs, lines: out.finals.map((l) => l.text) };
+      console.log('[ghost] SMOKE_OK', JSON.stringify(results, null, 2));
+      return;
+    }
+    if (process.env.GHOST_SMOKE === 'listen') {
+      // Listening start / stop in the real renderer (test/listen-lifecycle.js: GHOST_FAKE_AUDIO + the mock Live
+      // server): whatever the button presses, at most one capture runs, a stopped one stays stopped, and the
+      // sentence being spoken at Stop still reaches the transcript.
+      const got = { system: 0, mic: 0 };
+      ipcMain.on('live:audio', (_e, { source, data }) => { got[source] = (got[source] || 0) + Math.floor((data.length * 3) / 4) / 2; });
+      const js = (code) => win.webContents.executeJavaScript(code, true);
+      const rate = async (ms) => { const a = { ...got }; await wait(ms); return { system: Math.round(((got.system - a.system) * 1000) / ms), mic: Math.round(((got.mic - a.mic) * 1000) / ms) }; };
+      const state = () => js(`({ mode: window.__ghost.mode(), active: document.getElementById('btn-listen').classList.contains('active'), status: window.__ghost.status(), lines: window.__ghost.transcript().map((t) => (t.speaker || '') + ':' + t.text) })`);
+      const cfgKey = (key) => js(`window.ghost.setConfig({ gemini: { apiKey: ${JSON.stringify(key)} }, transcription: { engine: 'gemini', localFallback: false, source: 'both', mode: 'live', fallbackToChunk: 'pause' } }).then(() => window.__ghost.reloadConfig()).then(() => { window.__ghost.setTranscript([]); return true; })`);
+      const r = {};
+      await cfgKey('AIzaDUMMY-ghost-listen-0000000000');
+      // 1. Listen pressed twice in quick succession (double click, hotkey + click): the second press cancels
+      await js('window.__ghost.toggleListen(); window.__ghost.toggleListen(); true');
+      await wait(3000);
+      r.doublePress = { ...(await state()), rate: await rate(2000) };
+      // 2. one press: one capture per source, at the real-time rate (16000 samples/s each, not twice that)
+      await js('window.__ghost.toggleListen()');
+      await wait(1500);
+      r.single = { ...(await state()), rate: await rate(4000) };
+      // 3. Stop while the speaker is mid-sentence (the mock never ends the turn): that sentence is kept
+      await js('window.__ghost.stopListening(); true');
+      await wait(1500);
+      r.afterStop = { ...(await state()), rate: await rate(2000) };
+      // 4. Stop pressed while a start is still under way and about to fail over to chunked mode (bad key):
+      //    it must stay stopped
+      await cfgKey('bad-key-ghost-listen');
+      await js(`window.ghost.setConfig({ transcription: { fallbackToChunk: 'chunk' } }).then(() => window.__ghost.reloadConfig())`);
+      await js('window.__ghost.toggleListen(); window.__ghost.stopListening(); true');
+      await wait(3500);
+      r.stopDuringStart = { ...(await state()), rate: await rate(1500) };
+      results.listen = r;
       console.log('[ghost] SMOKE_OK', JSON.stringify(results, null, 2));
       return;
     }

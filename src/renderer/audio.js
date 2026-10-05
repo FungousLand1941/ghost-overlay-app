@@ -5,10 +5,13 @@
 //   - streaming mode can send each source to its own transcription session
 //     (=> transcript lines labelled YOU / THEM), with the mic silenced only
 //     while it is carrying nothing but your speakers' bleed (see GhostDSP.createEchoGate);
-//   - chunk mode (fallback) mixes them into one WAV every N seconds.
+//   - chunk mode (fallback) mixes them into one WAV every N seconds — after the
+//     same per-source chain, so the call is not in the mix twice (once from the
+//     loopback, once as speaker bleed on the mic) and a quiet mic is not drowned.
 //
 // Signal chain per source (dsp.js, shared with test/stt-bench.js):
-//   device rate -> windowed-sinc resample to 16 kHz -> 70 Hz high-pass -> click-free gain -> int16
+//   device rate -> windowed-sinc resample to 16 kHz -> 70 Hz high-pass
+//   (mic, with call audio present: -> echo canceller -> echo gate) -> click-free gain -> int16
 /* global GhostDSP */
 (function () {
   const TARGET_RATE = 16000;
@@ -51,6 +54,9 @@
       // the CPU is busy, which silently DROPS captured audio (measured: up to 7 % lost on a loaded laptop).
       this.ctx = new AudioContext({ latencyHint: 'playback' });
       this.rate = this.ctx.sampleRate;
+      // A suspended context processes nothing — no levels, no frames, and no error either. Keep it
+      // running: the system can suspend it under us (an output device change, sleep / resume).
+      this.ctx.onstatechange = () => { const st = this.ctx && this.ctx.state; this.stats.ctxState = st; if (this.running && st && st !== 'running' && st !== 'closed') this.ctx.resume().catch(() => {}); };
       const sink = this.ctx.createGain(); sink.gain.value = 0; // keeps the graph alive without playback
       sink.connect(this.ctx.destination);
 
@@ -143,7 +149,8 @@
       if (errors.length) this.onStatus(`Partial: ${errors.join('; ')}`);
 
       this.running = true;
-      if (this.onChunk) this.timer = setInterval(() => this.flush(), this.chunkSeconds * 1000);
+      if (this.ctx.state !== 'running') this.ctx.resume().catch(() => {});
+      if (this.onChunk) this.timer = setInterval(() => this.flush({ atPause: true }), this.chunkSeconds * 1000);
       return { active: Object.keys(this.analysers), errors, engine: this.stats.engine };
     }
 
@@ -161,48 +168,47 @@
       this.stats.lastRms = rms;
       if (name === 'system') { this.sysFrames++; if (rms > 0.00002) this.sysLiveFrames++; }
 
-      if (this.onChunk) this.buffers[name].push(f32);
-
-      if (this.onFrame) {
-        const now = performance.now();
-        const c = this.chain[name];
-        const pcm = c.hp.process(Float32Array.from(c.rs.process(f32)));
-        if (!pcm.length) return;
-        if (name === 'system') {
-          // loopback is captured post-volume-slider, so "active" is an absolute floor
-          // well above its silence level (~1e-5) but below quiet speech (~1e-2)
-          if (rms > 0.002) this.lastSysActiveAt = now;
-          // both sources are placed on the audio clock (ms): the gate and the canceller line them up by when
-          // the sound happened, not by the order their blocks happened to reach this thread
-          this.gate.system(GhostDSP.subRms(f32, this.rate), t * 1000);
-          if ('mic' in this.analysers) this.aec.ref(pcm, Math.round(t * TARGET_RATE)); // before the gain stage: the canceller wants the audio as it was played
-          this._emitFrame(name, pcm, rms);
-          return;
-        }
-        // Mic frames are held for one frame so they can be judged against the
-        // system audio that overlaps them (the mic hears the speakers ~50–200 ms
-        // late). A frame that is only speaker bleed is sent as silence so it is
-        // never transcribed as "you"; a frame where you are talking — even over
-        // the other side — is kept. On headphones nothing is ever silenced.
-        if ('system' in this.analysers) {
-          // first subtract what the call audio is predicted to sound like at the microphone; then let the
-          // gate judge what is left, with the canceller's own verdict on whether that is more than residue
-          const clean = this.aec.mic(pcm, Math.round(t * TARGET_RATE));
-          this.stats.echoDb = this.aec.last.converged ? -10 * Math.log10(this.aec.last.residue || 1) : 0; // how far below the call audio its residue on the mic is
-          if (clean.length) this.micQueue.push({ pcm: clean, rms, env: GhostDSP.subRms(clean, TARGET_RATE), at: this.aec.outEnd / (TARGET_RATE / 1000), hint: this.aec.last });
-          while (this.micQueue.length > 1) {
-            const f = this.micQueue.shift();
-            if (this.gate.mic(f.env, f.at, f.hint).duck) { this.stats.framesDucked++; this._emitFrame('mic', new Float32Array(f.pcm.length), 0, true); }
-            else this._emitFrame('mic', f.pcm, f.rms);
-          }
-          return;
-        }
+      const now = performance.now();
+      const c = this.chain[name];
+      const pcm = c.hp.process(Float32Array.from(c.rs.process(f32)));
+      if (!pcm.length) return;
+      if (name === 'system') {
+        // loopback is captured post-volume-slider, so "active" is an absolute floor
+        // well above its silence level (~1e-5) but below quiet speech (~1e-2)
+        if (rms > 0.002) this.lastSysActiveAt = now;
+        // both sources are placed on the audio clock (ms): the gate and the canceller line them up by when
+        // the sound happened, not by the order their blocks happened to reach this thread
+        this.gate.system(GhostDSP.subRms(f32, this.rate), t * 1000);
+        if ('mic' in this.analysers) this.aec.ref(pcm, Math.round(t * TARGET_RATE)); // before the gain stage: the canceller wants the audio as it was played
         this._emitFrame(name, pcm, rms);
+        return;
       }
+      // Mic frames are held for one frame so they can be judged against the
+      // system audio that overlaps them (the mic hears the speakers ~50–200 ms
+      // late). A frame that is only speaker bleed is sent as silence so it is
+      // never transcribed as "you"; a frame where you are talking — even over
+      // the other side — is kept. On headphones nothing is ever silenced.
+      if ('system' in this.analysers) {
+        // first subtract what the call audio is predicted to sound like at the microphone; then let the
+        // gate judge what is left, with the canceller's own verdict on whether that is more than residue
+        const clean = this.aec.mic(pcm, Math.round(t * TARGET_RATE));
+        this.stats.echoDb = this.aec.last.converged ? -10 * Math.log10(this.aec.last.residue || 1) : 0; // how far below the call audio its residue on the mic is
+        if (clean.length) this.micQueue.push({ pcm: clean, rms, env: GhostDSP.subRms(clean, TARGET_RATE), at: this.aec.outEnd / (TARGET_RATE / 1000), hint: this.aec.last });
+        while (this.micQueue.length > 1) {
+          const f = this.micQueue.shift();
+          if (this.gate.mic(f.env, f.at, f.hint).duck) { this.stats.framesDucked++; this._emitFrame('mic', new Float32Array(f.pcm.length), 0, true); }
+          else this._emitFrame('mic', f.pcm, f.rms);
+        }
+        return;
+      }
+      this._emitFrame(name, pcm, rms);
     }
 
     _emitFrame(name, pcm, rms, silent) {
+      const raw = this.onChunk ? pcm.slice() : null; // chunk mode: the level before the gain stage decides what is silence
       if (!silent) this.chain[name].agc.process(pcm);
+      if (this.onChunk) this.buffers[name].push({ raw, pcm });
+      if (!this.onFrame) return;
       let peak = 0; for (let i = 0; i < pcm.length; i++) { const a = pcm[i] < 0 ? -pcm[i] : pcm[i]; if (a > peak) peak = a; }
       this.stats.framesSent++;
       this.onFrame(name, b64(pcmToInt16(pcm)), { rms, peak, wait: this.wait || 0 });
@@ -220,41 +226,58 @@
       return out;
     }
 
-    // Chunk mode: mix whatever each source captured since the last flush.
-    flush() {
-      const names = Object.keys(this.analysers);
-      const per = names.map((n) => { const bufs = this.buffers[n]; this.buffers[n] = []; return concat(bufs); });
-      const len = Math.max(0, ...per.map((p) => p.length));
+    // Chunk mode: mix what each source captured since the last flush (16 kHz, cleaned, levelled).
+    // A timed flush ends the chunk at the quietest moment of its last 1.5 s and keeps the rest for
+    // the next chunk: a word cut in two is transcribed as two wrong words, one in each chunk.
+    // (Ask flushes everything at once: what was just said must be in the answer.)
+    flush({ atPause = false } = {}) {
+      const per = [];
+      for (const n of Object.keys(this.buffers)) {
+        const fr = this.buffers[n]; this.buffers[n] = [];
+        if (fr.length) per.push({ n, raw: concat(fr.map((f) => f.raw)), lev: concat(fr.map((f) => f.pcm)) });
+      }
+      const len = Math.max(0, ...per.map((p) => p.lev.length));
       if (!len) return;
-      const pcm = new Float32Array(len);
-      for (const p of per) for (let i = 0; i < p.length; i++) pcm[i] += p[i];
-      if (per.length > 1) for (let i = 0; i < len; i++) pcm[i] = Math.max(-1, Math.min(1, pcm[i]));
+      const mix = (key, a, b) => { const out = new Float32Array(Math.max(0, b - a)); for (const p of per) { const x = p[key], e = Math.min(b, x.length); for (let i = a; i < e; i++) out[i - a] += x[i]; } return out; };
+      let cut = len;
+      if (atPause && len > TARGET_RATE * 3) cut = quietestPoint(mix('lev', 0, len), len - Math.round(TARGET_RATE * 1.5), len);
+      for (const p of per) if (p.lev.length > cut) this.buffers[p.n].push({ raw: p.raw.slice(cut), pcm: p.lev.slice(cut) });
+      const raw = mix('raw', 0, cut), pcm = mix('lev', 0, cut);
 
       // crude VAD: skip near-silent chunks (saves API calls / rate limit)
-      let sum = 0; for (let i = 0; i < pcm.length; i++) sum += pcm[i] * pcm[i];
-      const rms = Math.sqrt(sum / pcm.length);
+      const rms = GhostDSP.rmsOf(raw);
       if (rms < SILENCE_RMS) { this.stats.chunksSkippedSilent++; return; }
 
-      // normalise quiet audio a bit so the STT model gets a healthy signal
+      // keep the mix in range (two people at once), and lift a chunk that is still quiet
       let peak = 0; for (let i = 0; i < pcm.length; i++) peak = Math.max(peak, Math.abs(pcm[i]));
-      if (peak > 0 && peak < 0.3) { const g = Math.min(0.9 / peak, 8); for (let i = 0; i < pcm.length; i++) pcm[i] *= g; }
+      const g = peak > 0.98 ? 0.98 / peak : peak > 0 && peak < 0.3 ? Math.min(0.9 / peak, 8) : 1;
+      if (g !== 1) for (let i = 0; i < pcm.length; i++) pcm[i] *= g;
 
-      const out16k = this.rate === TARGET_RATE ? pcm : Float32Array.from(GhostDSP.createResampler(this.rate, TARGET_RATE).process(pcm));
-      const wav = encodeWav(out16k, TARGET_RATE);
+      const wav = encodeWav(pcm, TARGET_RATE);
       this.stats.chunksSent++;
-      this.onChunk(b64(wav), { seconds: len / this.rate, rms });
+      this.onChunk(b64(wav), { seconds: cut / TARGET_RATE, rms });
     }
 
     stop() {
       this.running = false;
       clearInterval(this.timer);
       for (const p of this.procs) { try { p.port && (p.port.onmessage = null); p.disconnect(); } catch {} }
-      try { this.ctx?.close(); } catch {}
+      const ctx = this.ctx; this.ctx = null;
+      if (ctx && ctx.state !== 'closed') ctx.close().catch(() => {}); // stop() may run twice (start failure, then the caller)
       this.streams.forEach((s) => s.getTracks().forEach((t) => t.stop()));
       this.streams = []; this.procs = [];
       this.analysers = {};
       this.buffers = { system: [], mic: [] };
     }
+  }
+
+  // centre of the quietest 100 ms of x[a, b): where a pause (or the gap between two words) is
+  function quietestPoint(x, a, b) {
+    const W = Math.round(TARGET_RATE * 0.1), step = Math.round(TARGET_RATE * 0.01);
+    a = Math.max(0, a);
+    let best = Infinity, at = b;
+    for (let i = a; i + W <= b; i += step) { let e = 0; for (let j = i; j < i + W; j++) e += x[j] * x[j]; if (e < best) { best = e; at = i + (W >> 1); } }
+    return at;
   }
 
   function concat(bufs) {

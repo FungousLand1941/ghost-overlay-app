@@ -158,10 +158,11 @@ server.listen(0, async () => {
   const sysp = providers.systemPrompt({ profile: 'general', customPrompt: '', contextDocs: 'RESUME: 5 years of Go' });
   check('systemPrompt: background notes included', /BACKGROUND NOTES[\s\S]*RESUME: 5 years of Go/.test(sysp));
 
-  // 4. missing key path through providers.transcribe
+  // 4. no Gemini key: transcription moves to this computer (test/transcribe-local.test.js); until the
+  //    offline model is there, the chunk is answered at once and the message names both ways forward
   let err2 = null;
   try { await providers.transcribe({ gemini: { apiKey: '' } }, { wavBase64: wav }); } catch (e) { err2 = e; }
-  check('transcribe: missing key explains Gemini requirement', err2 && /Gemini API key/.test(err2.message));
+  check('transcribe: no key -> local engine, explains the Gemini option', err2 && err2.code === 'LOCAL_LOADING' && /Gemini API key/.test(err2.message));
 
   server.unref(); server.closeAllConnections();
   console.log(failures ? `\n${failures} FAILED` : '\nALL PASS');
