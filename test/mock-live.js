@@ -26,6 +26,7 @@ function startMock(port = 0) {
         if (frames === 3) ws.send(JSON.stringify({ serverContent: { interimInputTranscription: { text: 'wait what is a binary' } } }));
         if (frames === 4) ws.send(JSON.stringify({ serverContent: { inputTranscription: { text: 'wait what is a ' } } }));
         if (frames === 5) ws.send(JSON.stringify({ serverContent: { inputTranscription: { text: 'binary tree' } } }));
+        if (process.env.MOCK_LIVE_HOLD_TURN && frames >= 6) return; // the speaker is still mid-sentence: the turn never ends by itself
         if (frames === 6) ws.send(JSON.stringify({ serverContent: { modelTurn: { parts: [{ text: '.' }] }, turnComplete: true } }));
         // second utterance uses cumulative-style transcription
         if (frames === 8) ws.send(JSON.stringify({ serverContent: { inputTranscription: { text: 'like the' } } }));
